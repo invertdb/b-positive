@@ -723,22 +723,29 @@ impl<'db> WriteTxn<'db> {
         let inner = &self.db.inner;
         let txn = self.meta.txn + 1;
 
-        // the free list as of this commit: unreused free pages, pages released now, and the old list's own pages
-        let mut free: Vec<(u64, PageId)> = std::mem::take(&mut self.kept);
-        free.extend(self.reusable.drain(..).map(|p| (0, p)));
-        free.extend(self.recycled.drain(..).map(|p| (0, p)));
-        free.extend(self.released.drain(..).map(|p| (txn, p)));
+        // the free list as of this commit: pages free to reuse now (no reader can see them), and pages that become
+        // free once no reader predates this commit (released now, the old list's own pages) or that already waited
+        let mut immediate: Vec<PageId> = self.reusable.drain(..).chain(self.recycled.drain(..)).collect();
+        let mut deferred: Vec<(u64, PageId)> = std::mem::take(&mut self.kept);
+        deferred.extend(self.released.drain(..).map(|p| (txn, p)));
         let mut old = self.meta.freelist;
         while old != 0 {
             let next = u64_at(page_of(&self.map, old), 8);
-            free.push((txn, old));
+            deferred.push((txn, old));
             old = next;
         }
-        // its pages come from the end of the file, so writing the list doesn't change it
-        let list_pages = free.len().div_ceil(FREELIST_ENTRIES);
-        let first_list_page = self.meta.page_count;
-        self.meta.page_count += list_pages as u64;
-        self.meta.freelist = if list_pages == 0 { 0 } else { first_list_page };
+        // the list's own pages: free pages first (each one taken is one entry fewer), then the end of the file.
+        // Taking them only from the end would grow the list by its own size every commit.
+        let mut list_pages: Vec<PageId> = Vec::new();
+        while list_pages.len() < (deferred.len() + immediate.len()).div_ceil(FREELIST_ENTRIES) {
+            list_pages.push(immediate.pop().unwrap_or_else(|| {
+                self.meta.page_count += 1;
+                self.meta.page_count - 1
+            }));
+        }
+        let mut free = deferred;
+        free.extend(immediate.into_iter().map(|p| (0, p)));
+        self.meta.freelist = list_pages.first().copied().unwrap_or(0);
 
         // grow the file if needed (then remap below)
         let needed = self.meta.page_count * PAGE_SIZE as u64;
@@ -755,17 +762,19 @@ impl<'db> WriteTxn<'db> {
         for (&id, page) in &self.overflow {
             inner.file.write_all_at(page, id * PAGE_SIZE as u64)?;
         }
-        for (n, chunk) in free.chunks(FREELIST_ENTRIES).enumerate() {
+        // every list page is written: taking a free page for the list can leave the last one empty
+        for (n, &list_page) in list_pages.iter().enumerate() {
+            let chunk = free.chunks(FREELIST_ENTRIES).nth(n).unwrap_or(&[]);
             buffer.fill(0);
             buffer[0] = KIND_FREELIST;
             buffer[2..4].copy_from_slice(&(chunk.len() as u16).to_le_bytes());
-            let next = if n + 1 < list_pages { first_list_page + n as u64 + 1 } else { 0 };
+            let next = list_pages.get(n + 1).copied().unwrap_or(0);
             buffer[8..16].copy_from_slice(&next.to_le_bytes());
             for (i, &(freed_by, page)) in chunk.iter().enumerate() {
                 buffer[HEADER + 16 * i..HEADER + 16 * i + 8].copy_from_slice(&freed_by.to_le_bytes());
                 buffer[HEADER + 16 * i + 8..HEADER + 16 * i + 16].copy_from_slice(&page.to_le_bytes());
             }
-            inner.file.write_all_at(&buffer, (first_list_page + n as u64) * PAGE_SIZE as u64)?;
+            inner.file.write_all_at(&buffer, list_page * PAGE_SIZE as u64)?;
         }
         if inner.options.durability == Durability::Full {
             inner.file.sync_all()?;

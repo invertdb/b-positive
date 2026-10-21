@@ -124,3 +124,30 @@ fn many_keys_and_ranges() {
     assert_eq!(r.range_from(b"0010000").next().map(|(k, _)| k.to_vec()), Some(b"00100000".to_vec()));
     assert_eq!(r.iter().count(), 200_000);
 }
+
+#[test]
+fn many_small_commits_keep_the_file_and_free_list_small() {
+    // a server commits a handful of writes at a time: tens of thousands of commits must neither grow the file nor
+    // slow commits down (each commit writes the free list, so it must stay as small as the free space)
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("small.db");
+    let db = Db::open(&path, Options::default()).unwrap();
+    let started = std::time::Instant::now();
+    let mut slowest = std::time::Duration::ZERO;
+    for i in 0..20_000u32 {
+        let begun = std::time::Instant::now();
+        let mut w = db.begin_write();
+        w.put(format!("key{:04}", (i * 7919) % 1000).as_bytes(), &[i as u8; 100]).unwrap();
+        w.commit().unwrap();
+        slowest = slowest.max(begun.elapsed());
+    }
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(db.begin_read().len(), 1000);
+    // 1,000 keys of ~110 bytes fit in about 40 pages; a few hundred pages of churn and headroom is fine
+    assert!(size <= 4 << 20, "file grew to {size} bytes");
+    assert!(slowest < std::time::Duration::from_millis(50), "slowest commit {slowest:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "20,000 commits took {:?}", started.elapsed());
+    drop(db);
+    let db = Db::open(&path, Options::default()).unwrap();
+    assert_eq!(db.begin_read().len(), 1000, "reopens with its free list");
+}
