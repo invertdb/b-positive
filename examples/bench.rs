@@ -1,4 +1,4 @@
-//! Microbenchmark, matching bsharptree's `kvserver microbench`: N random keys ("key:" + 10 digits) with 100-byte
+//! Microbenchmark: N random keys ("key:" + 10 digits) with 100-byte
 //! values, committed every B puts; then N random gets on one thread, and on 8.
 use std::time::Instant;
 

@@ -1,7 +1,7 @@
 # b-positive
 
 A persistent, copy-on-write B+tree of byte-string keys and values, with snapshot readers. The storage core of
-invertdb, reimplemented from [bsharptree](https://github.com/thoward/bsharptree)'s design and lessons.
+invertdb.
 
 ```rust
 let db = b_positive::Db::open("data.db", Default::default())?;
@@ -41,19 +41,18 @@ for (key, value) in r.range_from(b"h") { /* in key order */ }
 
 ## Performance (`cargo run --release --example bench`)
 
-1M random 14-byte keys with 100-byte values, committed every 200, on Apple Silicon. bsharptree's
-.NET B+tree ran the same workload back to back:
+1M random 14-byte keys with 100-byte values, committed every 200, on Apple Silicon:
 
-| | b-positive | bsharptree (.NET) |
-|---|---:|---:|
-| writes | **196k/s** | 123k/s |
-| random reads, 1 thread | **2.29M/s** | 0.22M/s |
-| random reads, 8 threads | **16.9M/s** | (single-threaded) |
-| file | 256 MB | 247 MB |
+| | b-positive |
+|---|---:|
+| writes | 196k/s |
+| random reads, 1 thread | 2.29M/s |
+| random reads, 8 threads | 16.9M/s |
+| file | 256 MB |
 
 ## Not yet
 
 - Rebalancing of underfull branches (leaves merge; an emptied branch is removed). Trees stay
   correct, but can become less dense after heavy deletes.
 - Compaction (the file never shrinks).
-- Typed keys and values (order-preserving encodings) above the byte level.
+- Typed keys and values here. Types live above this level, in introvert's order-preserving `Codec`.
