@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 crc32fast = "1.5.3"
 memmap2 = "0.9.11"
+mimalloc = { version = "0.1.52", optional = true }
 
 [dev-dependencies]
 rand = "0.10.3"
@@ -17,3 +18,7 @@ name = "crash_writer_helper"
 path = "tests/support/crash_writer.rs"
 test = false
 doc = false
+
+[features]
+# mimalloc for the bench example (the library itself never sets an allocator)
+mimalloc = ["dep:mimalloc"]

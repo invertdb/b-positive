@@ -53,6 +53,10 @@ copy-on-write to the whole tree (Rodeh, 2008).
 | random reads, 8 threads | 16.9M/s |
 | file | 256 MB |
 
+Writes allocate a node copy per changed page. With mimalloc (`--features mimalloc`) they run at
+257k/s, against 201k/s with the system allocator. Reads change by about 3%. The library never
+sets an allocator: that's each binary's choice.
+
 ## Not yet
 
 - Rebalancing of underfull branches (leaves merge; an emptied branch is removed). Trees stay

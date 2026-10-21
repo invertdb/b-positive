@@ -6,6 +6,11 @@ use b_positive::{Db, Options};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
+/// With the `mimalloc` feature, a faster general-purpose allocator than the system's.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
     let batch: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(200);
