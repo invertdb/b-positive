@@ -15,6 +15,9 @@ for (key, value) in r.range_from(b"h") { /* in key order */ }
 
 ## Design
 
+A B+tree (Bayer and McCreight, 1972; Comer, 1979) committed by shadow paging (Lorie, 1977), applied
+copy-on-write to the whole tree (Rodeh, 2008).
+
 - **Pages:** 4 KB pages in one file, memory-mapped for reading. Reads binary-search page bytes in
   place: no node cache, no per-key objects.
 - **Nodes:** slotted pages. Variable-length keys (up to 1 KB) and values; values over 1 KB go to
@@ -56,3 +59,13 @@ for (key, value) in r.range_from(b"h") { /* in key order */ }
   correct, but can become less dense after heavy deletes.
 - Compaction (the file never shrinks).
 - Typed keys and values here. Types live above this level, in introvert's order-preserving `Codec`.
+
+## References
+
+- Bayer, R., and McCreight, E. (1972). Organization and maintenance of large ordered indexes.
+  *Acta Informatica* 1(3).
+- Comer, D. (1979). The ubiquitous B-tree. *ACM Computing Surveys* 11(2).
+- Graefe, G. (2011). Modern B-tree techniques. *Foundations and Trends in Databases* 3(4).
+- Lorie, R. A. (1977). Physical integrity in a large segmented database. *ACM Transactions on Database Systems*
+  2(1).
+- Rodeh, O. (2008). B-trees, shadowing, and clones. *ACM Transactions on Storage* 3(4).
