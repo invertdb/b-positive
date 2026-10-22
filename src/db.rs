@@ -428,6 +428,10 @@ impl<'db> WriteTxn<'db> {
         Value::Overflow { page: pages[0], len: value.len() as u32 }
     }
 
+    fn store_value_owned(&mut self, value: Vec<u8>) -> Value {
+        if value.len() <= MAX_INLINE_VALUE { Value::Inline(value) } else { self.store_value(&value) }
+    }
+
     fn read_value(&self, value: &Value) -> Vec<u8> {
         match value {
             Value::Inline(bytes) => bytes.clone(),
@@ -516,10 +520,10 @@ impl<'db> WriteTxn<'db> {
             return Ok(());
         }
 
-        let (mut path, leaf) = self.writable_path(key);
+        let (path, leaf) = self.writable_path(key);
         // whether the key landed at the node's right edge: a sorted bulk load appends, and an appended node splits
         // so the left half stays full (see `split`)
-        let mut appended;
+        let appended;
         let old = match self.dirty.get_mut(&leaf).unwrap() {
             Node::Leaf(entries) => match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
                 Ok(i) => {
@@ -539,85 +543,132 @@ impl<'db> WriteTxn<'db> {
             None => self.meta.entries += 1,
         }
 
-        // split upwards while a node overflows its page
-        let mut id = leaf;
-        while let Some((separator, right)) = self.split(id, appended) {
-            match path.pop() {
-                Some((parent, slot)) => {
-                    if let Node::Branch { entries, .. } = self.dirty.get_mut(&parent).unwrap() {
-                        appended = appended && slot == entries.len();
-                        entries.insert(slot, (separator, right));
-                    }
-                    id = parent;
-                }
-                None => {
-                    let root = self.alloc();
-                    self.dirty.insert(root, Node::Branch { leftmost: id, entries: vec![(separator, right)] });
-                    self.meta.root = root;
-                    break;
-                }
+        self.split_upwards(path, leaf, appended);
+        Ok(())
+    }
+
+    /// Sets each of `keys` (ascending, no duplicates) to the value `value(i, old)` makes from the value key `i` had,
+    /// in one pass: each leaf is found once for the run of keys it takes, the run is merged into it in order, and an
+    /// overflowing leaf splits into as many pages as it needs. A run past the tree's last key fills its pages left to
+    /// right (see `split`), so a sorted bulk load leaves them full. Values are made in key order.
+    pub fn put_sorted<K: AsRef<[u8]>>(&mut self, keys: &[K], mut value: impl FnMut(usize, Option<&[u8]>) -> Vec<u8>) -> io::Result<()> {
+        if let Some(key) = keys.iter().find(|k| k.as_ref().len() > MAX_KEY) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("key longer than {MAX_KEY} bytes ({})", key.as_ref().len())));
+        }
+        debug_assert!(keys.windows(2).all(|w| w[0].as_ref() < w[1].as_ref()), "keys must ascend");
+        let mut i = 0;
+        while i < keys.len() {
+            if self.meta.root == 0 {
+                let id = self.alloc();
+                self.dirty.insert(id, Node::Leaf(Vec::new()));
+                self.meta.root = id;
             }
+            let (path, leaf) = self.writable_path(keys[i].as_ref());
+            // the leaf takes the keys below the nearest separator to its right (none: the tree's right edge)
+            let upper = path.iter().rev().find_map(|&(branch, slot)| match &self.dirty[&branch] {
+                Node::Branch { entries, .. } => entries.get(slot).map(|(k, _)| k.clone()),
+                Node::Leaf(_) => None,
+            });
+            let end = i + keys[i..].partition_point(|k| upper.as_deref().is_none_or(|u| k.as_ref() < u));
+
+            let Node::Leaf(old) = std::mem::replace(self.dirty.get_mut(&leaf).unwrap(), Node::Leaf(Vec::new())) else { unreachable!() };
+            let mut merged = Vec::with_capacity(old.len() + end - i);
+            let mut old = old.into_iter().peekable();
+            for (j, key) in keys[i..end].iter().enumerate() {
+                let key = key.as_ref();
+                while let Some(entry) = old.next_if(|(k, _)| k.as_slice() < key) {
+                    merged.push(entry);
+                }
+                let previous = old.next_if(|(k, _)| k.as_slice() == key).map(|(_, v)| v);
+                let bytes = match &previous {
+                    Some(Value::Inline(bytes)) => value(i + j, Some(bytes)),
+                    Some(overflow) => value(i + j, Some(&self.read_value(overflow))),
+                    None => value(i + j, None),
+                };
+                match previous {
+                    Some(previous) => self.free_value(&previous),
+                    None => self.meta.entries += 1,
+                }
+                let stored = self.store_value_owned(bytes);
+                merged.push((key.to_vec(), stored));
+            }
+            // appended: the run ended past every key the tree had
+            let appended = upper.is_none() && old.peek().is_none();
+            merged.extend(old);
+            *self.dirty.get_mut(&leaf).unwrap() = Node::Leaf(merged);
+            self.split_upwards(path, leaf, appended);
+            i = end;
         }
         Ok(())
     }
 
-    /// Splits a node that no longer fits its page into two; returns the separator key and the new right node.
+    /// Splits a node that overflows its page, then its parent if the new nodes overflow it, and so on to the root.
+    fn split_upwards(&mut self, mut path: Vec<(PageId, usize)>, mut id: PageId, mut appended: bool) {
+        loop {
+            let pieces = self.split(id, appended);
+            if pieces.is_empty() {
+                return;
+            }
+            match path.pop() {
+                Some((parent, slot)) => {
+                    if let Node::Branch { entries, .. } = self.dirty.get_mut(&parent).unwrap() {
+                        appended = appended && slot == entries.len();
+                        entries.splice(slot..slot, pieces);
+                    }
+                    id = parent;
+                }
+                None => {
+                    // a new root, which may itself overflow if the old one split many ways
+                    let root = self.alloc();
+                    self.dirty.insert(root, Node::Branch { leftmost: id, entries: pieces });
+                    self.meta.root = root;
+                    id = root;
+                }
+            }
+        }
+    }
+
+    /// Splits a node that no longer fits its page into as few as hold it; returns each new node to its right, with
+    /// its separator key (none if it fits).
     ///
-    /// Both halves are closest in size, except for a leaf whose new entry landed at its right edge (`appended`):
-    /// then the left half is filled as full as it fits, and the right half takes the rest. Sorted inserts only ever
-    /// append, so they would otherwise leave every page they split half empty (Graefe, 2011, §10.2).
-    fn split(&mut self, id: PageId, appended: bool) -> Option<(Vec<u8>, PageId)> {
+    /// The pages are closest in size, except for a leaf whose new entries landed at its right edge (`appended`):
+    /// then each page is filled as full as it fits, left to right, and the last takes the rest. Sorted inserts only
+    /// ever append, so they would otherwise leave every page they split half empty (Graefe, 2011, §10.2).
+    fn split(&mut self, id: PageId, appended: bool) -> Vec<(Vec<u8>, PageId)> {
         let node = self.dirty.get(&id).unwrap();
         if node.size() <= PAGE_SIZE {
-            return None;
+            return Vec::new();
         }
+        let is_branch = matches!(node, Node::Branch { .. });
         let sizes: Vec<usize> = match node {
             Node::Leaf(entries) => entries.iter().map(|(k, v)| Node::entry_size_leaf(k, v)).collect(),
             Node::Branch { entries, .. } => entries.iter().map(|(k, _)| Node::entry_size_branch(k)).collect(),
         };
-        let total: usize = sizes.iter().sum();
-        let is_branch = matches!(node, Node::Branch { .. });
-        // the split point m: left keeps [..m]; a branch promotes entry m, a leaf starts the right with it
-        let mut best = (usize::MAX, 1);
-        let mut left = 0;
-        for m in 1..sizes.len() {
-            left += sizes[m - 1];
-            let right = total - left - if is_branch { sizes[m] } else { 0 };
-            if is_branch && m + 1 > sizes.len() {
-                break;
-            }
-            let worst = left.max(right);
-            if worst < best.0 {
-                best = (worst, m);
-            }
-        }
-        let mut m = best.1;
-        if appended && !is_branch {
-            // the largest left half that still leaves a right half fitting its page; m = len - 1 always does,
-            // since the node fit before this entry and one entry fits a page
-            let mut prefix = 0;
-            for m_candidate in 1..sizes.len() {
-                prefix += sizes[m_candidate - 1];
-                if HEADER + prefix <= PAGE_SIZE && HEADER + (total - prefix) <= PAGE_SIZE {
-                    m = m.max(m_candidate);
+        let cuts = cuts(&sizes, is_branch, appended && !is_branch);
+        let mut pieces = Vec::with_capacity(cuts.len());
+        for &cut in cuts.iter().rev() {
+            pieces.push(match self.dirty.get_mut(&id).unwrap() {
+                Node::Leaf(entries) => {
+                    let right = entries.split_off(cut);
+                    (right[0].0.clone(), Node::Leaf(right))
                 }
-            }
+                Node::Branch { entries, .. } => {
+                    let mut right = entries.split_off(cut);
+                    let (separator, middle) = right.remove(0);
+                    (separator, Node::Branch { leftmost: middle, entries: right })
+                }
+            });
         }
-        let right_id = self.alloc();
-        let (separator, right) = match self.dirty.get_mut(&id).unwrap() {
-            Node::Leaf(entries) => {
-                let right = entries.split_off(m);
-                (right[0].0.clone(), Node::Leaf(right))
-            }
-            Node::Branch { entries, .. } => {
-                let mut right = entries.split_off(m);
-                let (separator, middle) = right.remove(0);
-                (separator, Node::Branch { leftmost: middle, entries: right })
-            }
-        };
-        self.dirty.insert(right_id, right);
-        debug_assert!(self.dirty[&id].size() <= PAGE_SIZE && self.dirty[&right_id].size() <= PAGE_SIZE);
-        Some((separator, right_id))
+        pieces
+            .into_iter()
+            .rev()
+            .map(|(separator, node)| {
+                debug_assert!(node.size() <= PAGE_SIZE);
+                let right = self.alloc();
+                self.dirty.insert(right, node);
+                (separator, right)
+            })
+            .collect()
     }
 
     /// Removes `key`; returns whether it was there.
@@ -821,6 +872,53 @@ impl<'db> WriteTxn<'db> {
         committed.free = free;
         Ok(())
     }
+}
+
+/// Where to cut a node's entries (their sizes, in order) so each part fits a page: the index each part after the
+/// first starts at. A branch's entry at a cut moves up as the separator, so it counts in no part. `fill` fills each
+/// part as full as it fits, left to right; otherwise the parts are as many as filling needs, closest in size.
+fn cuts(sizes: &[usize], is_branch: bool, fill: bool) -> Vec<usize> {
+    let capacity = PAGE_SIZE - HEADER;
+    let fits = |cuts: &[usize]| {
+        let mut starts = vec![0];
+        starts.extend_from_slice(cuts);
+        starts.push(sizes.len());
+        starts.windows(2).enumerate().all(|(n, w)| {
+            let first = if is_branch && n > 0 { w[0] + 1 } else { w[0] };
+            w[0] < w[1] && sizes[first..w[1]].iter().sum::<usize>() <= capacity
+        })
+    };
+    let mut filled = Vec::new();
+    let (mut start, mut used) = (0, 0);
+    for (i, &size) in sizes.iter().enumerate() {
+        if used + size > capacity && i > start {
+            filled.push(i);
+            start = i;
+            used = if is_branch { 0 } else { size };
+        } else {
+            used += size;
+        }
+    }
+    if fill || filled.is_empty() {
+        return filled;
+    }
+    // as many parts, each cut where the running size comes closest to its share of the total
+    let parts = filled.len() + 1;
+    let total: usize = sizes.iter().sum();
+    let mut balanced = Vec::with_capacity(parts - 1);
+    let mut prefix = 0;
+    let mut i = 0;
+    for part in 1..parts {
+        let target = total * part / parts;
+        while i < sizes.len() && prefix + sizes[i] <= target {
+            prefix += sizes[i];
+            i += 1;
+        }
+        // cut before entry i (running size `prefix`) or after it, whichever is nearer the target
+        let cut = if i < sizes.len() && prefix + sizes[i] - target < target - prefix { i + 1 } else { i };
+        balanced.push(cut);
+    }
+    if fits(&balanced) { balanced } else { filled }
 }
 
 #[cfg(test)]

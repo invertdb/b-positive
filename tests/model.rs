@@ -26,6 +26,11 @@ fn value(rng: &mut StdRng) -> Vec<u8> {
     (0..len).map(|_| rng.random()).collect()
 }
 
+/// How many bytes of the old value's length a sorted batch's value records: 0 to 2, so values both stay and change size.
+fn rng_free_tag(i: usize) -> usize {
+    i % 3
+}
+
 fn check(snapshot: &ReadTxn, model: &BTreeMap<Vec<u8>, Vec<u8>>, context: &str) {
     assert_eq!(snapshot.len(), model.len() as u64, "{context}: count");
     let all: Vec<(Vec<u8>, Vec<u8>)> = snapshot.iter().map(|(k, v)| (k.to_vec(), v.into_owned())).collect();
@@ -53,6 +58,24 @@ fn matches_a_model_through_commits_aborts_reopens_and_snapshots() {
     for round in 0..300 {
         let mut working = model.clone();
         let mut w = db.begin_write();
+        if rng.random_range(0..3) == 0 {
+            // a sorted batch, each new value made from the old one (so the old one passed in is checked too)
+            let keys: Vec<Vec<u8>> = (0..rng.random_range(1..400)).map(|_| key(&mut rng)).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+            let fresh: Vec<Vec<u8>> = keys.iter().map(|_| value(&mut rng)).collect();
+            let expected: Vec<Option<Vec<u8>>> = keys.iter().map(|k| working.get(k).cloned()).collect();
+            w.put_sorted(&keys, |i, old| {
+                assert_eq!(old, expected[i].as_deref(), "round {round}: old value");
+                let mut v = fresh[i].clone();
+                v.extend_from_slice(&old.map_or(0, <[u8]>::len).to_le_bytes()[..rng_free_tag(i)]);
+                v
+            })
+            .unwrap();
+            for (i, k) in keys.into_iter().enumerate() {
+                let mut v = fresh[i].clone();
+                v.extend_from_slice(&expected[i].as_ref().map_or(0, Vec::len).to_le_bytes()[..rng_free_tag(i)]);
+                working.insert(k, v);
+            }
+        }
         for _ in 0..rng.random_range(1..200) {
             let k = key(&mut rng);
             if rng.random_range(0..4) == 0 {
@@ -161,6 +184,66 @@ fn sorted_inserts_fill_their_pages() {
     assert_eq!(db.begin_read().len(), count as u64);
     let random_size = std::fs::metadata(&shuffled).unwrap().len();
     assert!(size < random_size, "sorted {size} bytes vs random {random_size}");
+}
+
+#[test]
+fn sorted_batches_fill_their_pages() {
+    // put_sorted over a bulk load in batches, then a batch merged into the middle: pages full, every key there
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("batches.db");
+    let db = Db::open(&path, Options { durability: Durability::Process }).unwrap();
+    let count = 200_000u32;
+    let keys: Vec<Vec<u8>> = (0..count).map(|i| format!("{:016}", i * 2).into_bytes()).collect();
+    for batch in keys.chunks(30_000) {
+        let mut w = db.begin_write();
+        w.put_sorted(batch, |i, old| {
+            assert_eq!(old, None);
+            (i as u32).to_le_bytes().to_vec()
+        })
+        .unwrap();
+        w.commit().unwrap();
+    }
+    let ideal = count as u64 * (16 + 4 + 8);
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert!(size < ideal * 5 / 4, "{size} bytes for {ideal} bytes of entries: pages aren't filling");
+
+    // odd keys in between, and every tenth even key again: each lands in its leaf, which splits as it must
+    let mut middle: Vec<Vec<u8>> = (0..count).filter(|i| i % 10 == 0).flat_map(|i| [format!("{:016}", i * 2), format!("{:016}", i * 2 + 1)]).map(String::into_bytes).collect();
+    middle.sort();
+    let mut w = db.begin_write();
+    w.put_sorted(&middle, |_, old| old.map_or(b"new".to_vec(), |o| [o, b"+"].concat())).unwrap();
+    w.commit().unwrap();
+    let r = db.begin_read();
+    assert_eq!(r.len(), count as u64 + count as u64 / 10);
+    let mut previous: Option<Vec<u8>> = None;
+    for (k, v) in r.iter() {
+        assert!(previous.as_deref().is_none_or(|p| p < k), "order");
+        let n: u32 = std::str::from_utf8(k).unwrap().parse().unwrap();
+        match (n % 2, (n / 2) % 10) {
+            (1, _) => assert_eq!(&*v, b"new"),
+            (0, 0) => assert_eq!(v.last(), Some(&b'+')),
+            _ => assert_eq!(v.len(), 4),
+        }
+        previous = Some(k.to_vec());
+    }
+}
+
+#[test]
+fn a_sorted_batch_into_an_empty_tree_splits_the_root_many_ways() {
+    // one batch of large values: the first leaf splits into hundreds of pages, its new root into several
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(dir.path().join("wide.db"), Options::default()).unwrap();
+    let keys: Vec<Vec<u8>> = (0..60_000u32).map(|i| format!("{i:08}{}", "k".repeat(200)).into_bytes()).collect();
+    let mut w = db.begin_write();
+    w.put_sorted(&keys, |i, _| vec![i as u8; 300]).unwrap();
+    w.commit().unwrap();
+    let r = db.begin_read();
+    assert_eq!(r.len(), keys.len() as u64);
+    for (i, (k, v)) in r.iter().enumerate() {
+        assert_eq!(k, keys[i].as_slice());
+        assert_eq!(&*v, &vec![i as u8; 300][..]);
+    }
+    assert_eq!(r.get(&keys[31_337]).as_deref(), Some(&vec![(31_337 % 256) as u8; 300][..]));
 }
 
 #[test]
