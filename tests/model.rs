@@ -126,6 +126,44 @@ fn many_keys_and_ranges() {
 }
 
 #[test]
+fn sorted_inserts_fill_their_pages() {
+    // a sorted bulk load (every insert at the right edge) should leave pages nearly full, not half full
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sorted.db");
+    let db = Db::open(&path, Options { durability: Durability::Process }).unwrap();
+    let count = 200_000u32;
+    let mut w = db.begin_write();
+    for i in 0..count {
+        w.put(format!("{i:016}").as_bytes(), &i.to_le_bytes()).unwrap();
+    }
+    w.commit().unwrap();
+    assert_eq!(db.begin_read().len(), count as u64);
+    // 16-byte key, 4-byte value: 8 bytes of entry overhead each, so 28 bytes an entry
+    let entry = 16 + 4 + 8;
+    let ideal = count as u64 * entry as u64;
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert!(size < ideal * 5 / 4, "{size} bytes for {ideal} bytes of entries: pages aren't filling");
+
+    // the same entries in random order take appreciably more room (balanced splits leave pages ~70% full)
+    let shuffled = dir.path().join("shuffled.db");
+    let db = Db::open(&shuffled, Options { durability: Durability::Process }).unwrap();
+    let mut order: Vec<u32> = (0..count).collect();
+    let mut state = 1u64;
+    for i in (1..order.len()).rev() {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        order.swap(i, (state >> 33) as usize % (i + 1));
+    }
+    let mut w = db.begin_write();
+    for &i in &order {
+        w.put(format!("{i:016}").as_bytes(), &i.to_le_bytes()).unwrap();
+    }
+    w.commit().unwrap();
+    assert_eq!(db.begin_read().len(), count as u64);
+    let random_size = std::fs::metadata(&shuffled).unwrap().len();
+    assert!(size < random_size, "sorted {size} bytes vs random {random_size}");
+}
+
+#[test]
 fn many_small_commits_keep_the_file_and_free_list_small() {
     // a server commits a handful of writes at a time: tens of thousands of commits must neither grow the file nor
     // slow commits down (each commit writes the free list, so it must stay as small as the free space)

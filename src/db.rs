@@ -517,11 +517,18 @@ impl<'db> WriteTxn<'db> {
         }
 
         let (mut path, leaf) = self.writable_path(key);
+        // whether the key landed at the node's right edge: a sorted bulk load appends, and an appended node splits
+        // so the left half stays full (see `split`)
+        let mut appended;
         let old = match self.dirty.get_mut(&leaf).unwrap() {
             Node::Leaf(entries) => match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                Ok(i) => Some(std::mem::replace(&mut entries[i].1, value)),
+                Ok(i) => {
+                    appended = i + 1 == entries.len();
+                    Some(std::mem::replace(&mut entries[i].1, value))
+                }
                 Err(i) => {
                     entries.insert(i, (key.to_vec(), value));
+                    appended = i + 1 == entries.len();
                     None
                 }
             },
@@ -534,10 +541,11 @@ impl<'db> WriteTxn<'db> {
 
         // split upwards while a node overflows its page
         let mut id = leaf;
-        while let Some((separator, right)) = self.split(id) {
+        while let Some((separator, right)) = self.split(id, appended) {
             match path.pop() {
                 Some((parent, slot)) => {
                     if let Node::Branch { entries, .. } = self.dirty.get_mut(&parent).unwrap() {
+                        appended = appended && slot == entries.len();
                         entries.insert(slot, (separator, right));
                     }
                     id = parent;
@@ -553,9 +561,12 @@ impl<'db> WriteTxn<'db> {
         Ok(())
     }
 
-    /// Splits a node that no longer fits its page into two, where both halves are closest in size; returns the
-    /// separator key and the new right node.
-    fn split(&mut self, id: PageId) -> Option<(Vec<u8>, PageId)> {
+    /// Splits a node that no longer fits its page into two; returns the separator key and the new right node.
+    ///
+    /// Both halves are closest in size, except for a leaf whose new entry landed at its right edge (`appended`):
+    /// then the left half is filled as full as it fits, and the right half takes the rest. Sorted inserts only ever
+    /// append, so they would otherwise leave every page they split half empty (Graefe, 2011, §10.2).
+    fn split(&mut self, id: PageId, appended: bool) -> Option<(Vec<u8>, PageId)> {
         let node = self.dirty.get(&id).unwrap();
         if node.size() <= PAGE_SIZE {
             return None;
@@ -580,7 +591,18 @@ impl<'db> WriteTxn<'db> {
                 best = (worst, m);
             }
         }
-        let m = best.1;
+        let mut m = best.1;
+        if appended && !is_branch {
+            // the largest left half that still leaves a right half fitting its page; m = len - 1 always does,
+            // since the node fit before this entry and one entry fits a page
+            let mut prefix = 0;
+            for m_candidate in 1..sizes.len() {
+                prefix += sizes[m_candidate - 1];
+                if HEADER + prefix <= PAGE_SIZE && HEADER + (total - prefix) <= PAGE_SIZE {
+                    m = m.max(m_candidate);
+                }
+            }
+        }
         let right_id = self.alloc();
         let (separator, right) = match self.dirty.get_mut(&id).unwrap() {
             Node::Leaf(entries) => {
