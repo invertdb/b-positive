@@ -14,7 +14,8 @@ use memmap2::Mmap;
 use crate::page::*;
 
 const MAGIC: &[u8; 8] = b"BPOSITIV";
-const VERSION: u32 = 1;
+/// 2: slots of 4 bytes, with key summaries, and a page prefix with a copy of its first bytes (page.rs).
+const VERSION: u32 = 2;
 const META_BYTES: usize = 8 + 4 + 4 + 8 * 5;
 const INITIAL_PAGES: u64 = 64;
 
@@ -113,7 +114,14 @@ impl Db {
             .into_iter()
             .flatten()
             .max_by_key(|m| m.txn)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no valid meta page: not a b-positive file"))?;
+            .ok_or_else(|| {
+                let version = u32::from_le_bytes(map[8..12].try_into().unwrap());
+                if &map[0..8] == MAGIC && version != VERSION {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("a b-positive file of format {version}; this library reads format {VERSION}: rebuild it"))
+                } else {
+                    io::Error::new(io::ErrorKind::InvalidData, "no valid meta page: not a b-positive file")
+                }
+            })?;
 
         // the free list, from its chain of pages
         let mut free = Vec::new();
@@ -778,7 +786,7 @@ impl<'db> WriteTxn<'db> {
             Some(node) => node.size(),
             None => used(page_of(&self.map, left)),
         };
-        if right_node.is_branch() || left_size + right_node.size() - HEADER > PAGE_SIZE {
+        if right_node.is_branch() || left_size + right_node.size() - SLOTS > PAGE_SIZE {
             return;
         }
         let left = self.writable(left);
@@ -899,7 +907,7 @@ impl<'db> WriteTxn<'db> {
 /// first starts at. A branch's entry at a cut moves up as the separator, so it counts in no part. `fill` fills each
 /// part as full as it fits, left to right; otherwise the parts are as many as filling needs, closest in size.
 fn cuts(sizes: &[usize], is_branch: bool, fill: bool) -> Vec<usize> {
-    let capacity = PAGE_SIZE - HEADER;
+    let capacity = PAGE_SIZE - SLOTS;
     let fits = |cuts: &[usize]| {
         let mut starts = vec![0];
         starts.extend_from_slice(cuts);

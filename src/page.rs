@@ -1,10 +1,12 @@
 //! Page layouts. Every page is [`PAGE_SIZE`] bytes and starts with its kind.
 //!
-//! Node pages (leaves and branches) are slotted: a 16-byte header, then a sorted array of 2-byte entry
-//! offsets, with the entries themselves packed from the end of the page backwards.
+//! Node pages (leaves and branches) are slotted: a 16-byte header and 8 bytes of prefix, then a sorted array of
+//! 4-byte slots, with the entries themselves packed from the end of the page backwards.
 //!
 //! ```text
-//! header   kind u8 | 0 | count u16 | entries start u16 | garbage u16 | leftmost child u64 (branches only)
+//! header   kind u8 | prefix u8 | count u16 | entries start u16 | garbage u16 | leftmost child u64 (branches only)
+//! prefix   the prefix's first 8 bytes (zero past its end)
+//! slot     entry offset u16 | summary u16
 //! leaf     key length u16 | value length u32 (top bit: overflow) | key | value, or overflow page u64
 //! branch   key length u16 | child u64 | key           (the child holds keys >= this key)
 //! overflow kind u8 | 0 | used u16 | 0 u32 | next page u64 | data
@@ -13,12 +15,26 @@
 //!
 //! A branch's leftmost child holds the keys below its first key.
 //!
+//! **Searching a page** reads its slots, not its keys. Every key of a page starts with the same `prefix` bytes (the
+//! first key's); a slot's summary is its key's next two bytes (zero past the key's end), as a big-endian number. So
+//! summaries ascend as the keys do, and a search counts the summaries below the searched key's in one pass over the
+//! slot array; only keys whose summary ties with it are compared in full. (The prefix only ever shrinks while a
+//! writer edits a page, so it is a prefix of every key, if not always the longest.)
+//!
 //! "Entries start" is the lowest entry's offset and "garbage" the bytes of entries removed or replaced since the page
 //! was last packed: a writer edits a page in place with them, and readers ignore them. (Pages written before they
 //! existed hold 0 for both, and are packed, so the start is then found from the slots.)
 
 pub const PAGE_SIZE: usize = 4096;
 pub const HEADER: usize = 16;
+/// A node page's slot: entry offset and summary.
+pub const SLOT: usize = 4;
+/// Bytes of a node page's prefix kept after its header, so a search reads only the header and slots.
+const PREFIX_COPY: usize = 8;
+/// Where a node page's slots start.
+pub const SLOTS: usize = HEADER + PREFIX_COPY;
+/// The longest prefix a page records.
+const MAX_PREFIX: usize = 255;
 
 pub const KIND_LEAF: u8 = 1;
 pub const KIND_BRANCH: u8 = 2;
@@ -65,7 +81,66 @@ pub fn count(page: &[u8]) -> usize {
 
 #[inline]
 fn entry_offset(page: &[u8], i: usize) -> usize {
-    u16_at(page, HEADER + 2 * i) as usize
+    u16_at(page, SLOTS + SLOT * i) as usize
+}
+
+#[inline]
+fn prefix_len(page: &[u8]) -> usize {
+    page[1] as usize
+}
+
+/// A key's summary on a page whose keys share `prefix` bytes: its next two bytes, zero past its end.
+#[inline]
+fn summary_of(key: &[u8], prefix: usize) -> u16 {
+    let byte = |i: usize| key.get(prefix + i).copied().unwrap_or(0) as u16;
+    byte(0) << 8 | byte(1)
+}
+
+/// Where `key` falls among a node page's keys by their summaries alone: the keys before `low` are below it, those
+/// from `high` on above it, and those between tie with it (to compare in full).
+#[inline]
+fn locate(page: &[u8], key: &[u8]) -> (usize, usize) {
+    let n = count(page);
+    if n == 0 {
+        return (0, 0);
+    }
+    let prefix = prefix_len(page);
+    if prefix > 0 {
+        // the prefix's first bytes from their copy; a longer prefix's rest from the first key
+        let copied = prefix.min(PREFIX_COPY);
+        let head = key[..copied.min(key.len())].cmp(&page[HEADER..HEADER + copied]);
+        let order = if head.is_ne() || prefix <= PREFIX_COPY || key.len() <= copied {
+            head
+        } else {
+            let first = key_at(page, entry_offset(page, 0));
+            key[copied..prefix.min(key.len())].cmp(&first[copied..prefix])
+        };
+        match order {
+            std::cmp::Ordering::Less => return (0, 0),
+            std::cmp::Ordering::Greater => return (n, n),
+            // a key shorter than the prefix and a prefix of it sorts before every key
+            std::cmp::Ordering::Equal if key.len() < prefix => return (0, 0),
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+    let wanted = summary_of(key, prefix);
+    let summary = |i: usize| u16_at(page, SLOTS + SLOT * i + 2);
+    // the first slot whose summary is >= wanted, then the first > wanted (branch-free halving)
+    let first_at_least = |bound: &dyn Fn(u16) -> bool| {
+        let (mut base, mut size) = (0, n);
+        while size > 1 {
+            let half = size / 2;
+            base = if bound(summary(base + half - 1)) { base + half } else { base };
+            size -= half;
+        }
+        base + bound(summary(base)) as usize
+    };
+    let low = first_at_least(&|s| s < wanted);
+    let mut high = low;
+    while high < n && summary(high) == wanted {
+        high += 1;
+    }
+    (low, high)
 }
 
 /// A value as a leaf holds it: the bytes, or where its overflow chain starts.
@@ -114,7 +189,7 @@ pub fn branch_child(page: &[u8], i: usize) -> PageId {
 
 /// In a leaf: Ok(index) of the key, or Err(index where it would go).
 pub fn leaf_search(page: &[u8], key: &[u8]) -> Result<usize, usize> {
-    let (mut low, mut high) = (0, count(page));
+    let (mut low, mut high) = locate(page, key);
     while low < high {
         let mid = (low + high) / 2;
         match leaf_key(page, mid).cmp(key) {
@@ -129,7 +204,7 @@ pub fn leaf_search(page: &[u8], key: &[u8]) -> Result<usize, usize> {
 /// In a branch: which child holds `key`, as a child slot: 0 is the leftmost child, i + 1 the child of entry i.
 pub fn branch_slot(page: &[u8], key: &[u8]) -> usize {
     // the number of entries whose key is <= key
-    let (mut low, mut high) = (0, count(page));
+    let (mut low, mut high) = locate(page, key);
     while low < high {
         let mid = (low + high) / 2;
         if branch_key(page, mid) <= key {
@@ -190,7 +265,7 @@ fn garbage(page: &[u8]) -> usize {
 /// Bytes a node page needs (as [`Node::size`] counts them): header, slots and live entries.
 #[inline]
 pub fn used(page: &[u8]) -> usize {
-    HEADER + 2 * count(page) + (PAGE_SIZE - entries_start(page)) - garbage(page)
+    SLOTS + SLOT * count(page) + (PAGE_SIZE - entries_start(page)) - garbage(page)
 }
 
 /// The bytes of the entry at `at` (not its slot).
@@ -213,7 +288,7 @@ fn pack(page: &mut [u8]) {
         let len = entry_len(&copy, at);
         end -= len;
         page[end..end + len].copy_from_slice(&copy[at..at + len]);
-        set_u16(page, HEADER + 2 * i, end);
+        set_u16(page, SLOTS + SLOT * i, end);
     }
     set_u16(page, 4, end);
     set_u16(page, 6, 0);
@@ -222,10 +297,10 @@ fn pack(page: &mut [u8]) {
 /// Room for an entry of `len` bytes and its slot, packing the page if its free space is in pieces: the entry's
 /// offset, or none if the page can't hold it.
 fn reserve(page: &mut [u8], len: usize) -> Option<usize> {
-    if used(page) + 2 + len > PAGE_SIZE {
+    if used(page) + SLOT + len > PAGE_SIZE {
         return None;
     }
-    if entries_start(page) < HEADER + 2 * (count(page) + 1) + len {
+    if entries_start(page) < SLOTS + SLOT * (count(page) + 1) + len {
         pack(page);
     }
     let at = entries_start(page) - len;
@@ -233,11 +308,44 @@ fn reserve(page: &mut [u8], len: usize) -> Option<usize> {
     Some(at)
 }
 
-/// Puts a slot pointing at `at` in position `i`, after the slots before it.
-fn insert_slot(page: &mut [u8], i: usize, at: usize) {
+/// The key of the entry at offset `at`.
+fn key_at(page: &[u8], at: usize) -> &[u8] {
+    let key_len = u16_at(page, at) as usize;
+    let start = if kind(page) == KIND_BRANCH { at + 10 } else { at + 6 };
+    &page[start..start + key_len]
+}
+
+/// Shortens the page's prefix to what it shares with `key` (a key about to join it), and summarizes every slot
+/// again if it changed. The first key of an empty page sets it.
+fn admit(page: &mut [u8], key: &[u8]) {
     let n = count(page);
-    page.copy_within(HEADER + 2 * i..HEADER + 2 * n, HEADER + 2 * i + 2);
-    set_u16(page, HEADER + 2 * i, at);
+    let prefix = prefix_len(page);
+    let shared = if n == 0 {
+        key.len().min(MAX_PREFIX)
+    } else {
+        let first = key_at(page, entry_offset(page, 0));
+        first[..prefix].iter().zip(key).take_while(|(a, b)| a == b).count()
+    };
+    if n > 0 && shared == prefix {
+        return;
+    }
+    page[1] = shared as u8;
+    let copied = shared.min(PREFIX_COPY);
+    page[HEADER..HEADER + PREFIX_COPY].fill(0);
+    page[HEADER..HEADER + copied].copy_from_slice(&key[..copied]);
+    for i in 0..n {
+        let summary = summary_of(key_at(page, entry_offset(page, i)), shared);
+        set_u16(page, SLOTS + SLOT * i + 2, summary as usize);
+    }
+}
+
+/// Puts a slot for `key`'s entry at offset `at` in position `i`, after the slots before it.
+fn insert_slot(page: &mut [u8], i: usize, at: usize, key: &[u8]) {
+    admit(page, key);
+    let n = count(page);
+    page.copy_within(SLOTS + SLOT * i..SLOTS + SLOT * n, SLOTS + SLOT * i + SLOT);
+    set_u16(page, SLOTS + SLOT * i, at);
+    set_u16(page, SLOTS + SLOT * i + 2, summary_of(key, prefix_len(page)) as usize);
     set_u16(page, 2, n + 1);
 }
 
@@ -268,7 +376,7 @@ pub fn leaf_insert(page: &mut [u8], i: usize, key: &[u8], value: &ValueRef) -> b
     set_u16(page, at, key.len());
     page[at + 6..at + 6 + key.len()].copy_from_slice(key);
     write_value(page, at, key.len(), value);
-    insert_slot(page, i, at);
+    insert_slot(page, i, at, key);
     true
 }
 
@@ -296,11 +404,12 @@ pub fn remove_entry(page: &mut [u8], i: usize) {
     let n = count(page);
     let at = entry_offset(page, i);
     let len = entry_len(page, at);
-    page.copy_within(HEADER + 2 * i + 2..HEADER + 2 * n, HEADER + 2 * i);
+    page.copy_within(SLOTS + SLOT * i + SLOT..SLOTS + SLOT * n, SLOTS + SLOT * i);
     set_u16(page, 2, n - 1);
     if n == 1 {
         set_u16(page, 4, PAGE_SIZE);
         set_u16(page, 6, 0);
+        page[1] = 0;
     } else if at == entries_start(page) {
         set_u16(page, 4, at + len);
     } else {
@@ -314,7 +423,7 @@ pub fn branch_insert(page: &mut [u8], i: usize, key: &[u8], child: PageId) -> bo
     set_u16(page, at, key.len());
     page[at + 2..at + 10].copy_from_slice(&child.to_le_bytes());
     page[at + 10..at + 10 + key.len()].copy_from_slice(key);
-    insert_slot(page, i, at);
+    insert_slot(page, i, at, key);
     true
 }
 
@@ -560,14 +669,14 @@ impl Node {
     }
 
     pub fn entry_size_leaf(key: &[u8], value: &Value) -> usize {
-        2 + 6 + key.len() + match value {
+        SLOT + 6 + key.len() + match value {
             Value::Inline(bytes) => bytes.len(),
             Value::Overflow { .. } => 8,
         }
     }
 
     pub fn entry_size_branch(key: &[u8]) -> usize {
-        2 + 10 + key.len()
+        SLOT + 10 + key.len()
     }
 
     /// Bytes this node needs as a page.
@@ -575,7 +684,7 @@ impl Node {
         if let Node::Page(page) = self {
             return used(&page[..]);
         }
-        HEADER
+        SLOTS
             + match self {
                 Node::Page(_) => unreachable!(),
                 Node::Leaf(entries) => entries.iter().map(|(k, v)| Self::entry_size_leaf(k, v)).sum::<usize>(),
@@ -605,9 +714,9 @@ impl Node {
                 page[0] = KIND_LEAF;
                 page[2..4].copy_from_slice(&(entries.len() as u16).to_le_bytes());
                 for (i, (key, value)) in entries.iter().enumerate() {
-                    let size = Self::entry_size_leaf(key, value) - 2;
+                    let size = Self::entry_size_leaf(key, value) - SLOT;
                     end -= size;
-                    page[HEADER + 2 * i..HEADER + 2 * i + 2].copy_from_slice(&(end as u16).to_le_bytes());
+                    page[SLOTS + SLOT * i..SLOTS + SLOT * i + 2].copy_from_slice(&(end as u16).to_le_bytes());
                     page[end..end + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
                     page[end + 6..end + 6 + key.len()].copy_from_slice(key);
                     let start = end + 6 + key.len();
@@ -628,9 +737,9 @@ impl Node {
                 page[2..4].copy_from_slice(&(entries.len() as u16).to_le_bytes());
                 page[8..16].copy_from_slice(&leftmost.to_le_bytes());
                 for (i, (key, child)) in entries.iter().enumerate() {
-                    let size = Self::entry_size_branch(key) - 2;
+                    let size = Self::entry_size_branch(key) - SLOT;
                     end -= size;
-                    page[HEADER + 2 * i..HEADER + 2 * i + 2].copy_from_slice(&(end as u16).to_le_bytes());
+                    page[SLOTS + SLOT * i..SLOTS + SLOT * i + 2].copy_from_slice(&(end as u16).to_le_bytes());
                     page[end..end + 2].copy_from_slice(&(key.len() as u16).to_le_bytes());
                     page[end + 2..end + 10].copy_from_slice(&child.to_le_bytes());
                     page[end + 10..end + 10 + key.len()].copy_from_slice(key);
@@ -638,6 +747,24 @@ impl Node {
             }
         }
         set_u16(page, 4, end);
+        // the keys' longest shared prefix (the first and last key's), and each slot's summary past it
+        let keys: Vec<&[u8]> = match self {
+            Node::Leaf(entries) => entries.iter().map(|(k, _)| k.as_slice()).collect(),
+            Node::Branch { entries, .. } => entries.iter().map(|(k, _)| k.as_slice()).collect(),
+            Node::Page(_) => unreachable!(),
+        };
+        let prefix = match (keys.first(), keys.last()) {
+            (Some(first), Some(last)) => first.iter().zip(last.iter()).take_while(|(a, b)| a == b).count().min(MAX_PREFIX),
+            _ => 0,
+        };
+        page[1] = prefix as u8;
+        if let Some(first) = keys.first() {
+            let copied = prefix.min(PREFIX_COPY);
+            page[HEADER..HEADER + copied].copy_from_slice(&first[..copied]);
+        }
+        for (i, key) in keys.iter().enumerate() {
+            set_u16(page, SLOTS + SLOT * i + 2, summary_of(key, prefix) as usize);
+        }
     }
 }
 
@@ -745,6 +872,54 @@ mod tests {
             let (Node::Branch { leftmost: a, entries: x }, Node::Branch { leftmost: b, entries: y }) = (&widened, &model) else { unreachable!() };
             assert_eq!((a, x), (b, y));
             assert_eq!(node.size(), model.size());
+        }
+    }
+
+    #[test]
+    fn searches_by_summary_match_comparing_every_key() {
+        let mut state = 0xdead_beef_u64;
+        for round in 0..300 {
+            // keys sharing a prefix of 0 to 20 bytes, with short and long tails (some a prefix of another)
+            let shared: Vec<u8> = (0..(round % 21)).map(|i| b'a' + (i % 3) as u8).collect();
+            let mut keys: Vec<Vec<u8>> = (0..(1 + next(&mut state) % 120))
+                .map(|_| {
+                    let mut key = shared.clone();
+                    key.extend((0..next(&mut state) % 5).map(|_| (next(&mut state) % 4) as u8 * 60));
+                    key
+                })
+                .collect();
+            keys.sort();
+            keys.dedup();
+            let leaf = Node::Leaf(keys.iter().map(|k| (k.clone(), Value::Inline(vec![1]))).collect());
+            let branch = Node::Branch { leftmost: 1, entries: keys.iter().enumerate().map(|(i, k)| (k.clone(), i as u64 + 2)).collect() };
+            let mut encoded_leaf = new_page(0);
+            leaf.encode(&mut encoded_leaf[..]);
+            let mut encoded_branch = new_page(0);
+            branch.encode(&mut encoded_branch[..]);
+            // the same leaf built by inserts in random order
+            let mut inserted = new_page(KIND_LEAF);
+            let mut order = keys.clone();
+            for i in (1..order.len()).rev() {
+                order.swap(i, (next(&mut state) as usize) % (i + 1));
+            }
+            for key in &order {
+                let at = leaf_search(&inserted[..], key).unwrap_err();
+                assert!(leaf_insert(&mut inserted[..], at, key, &ValueRef::Inline(&[1])));
+            }
+            let mut probes = keys.clone();
+            for _ in 0..60 {
+                let mut probe: Vec<u8> = shared[..(next(&mut state) as usize) % (shared.len() + 1)].to_vec();
+                probe.extend((0..next(&mut state) % 6).map(|_| (next(&mut state) % 5) as u8 * 50));
+                probes.push(probe);
+            }
+            probes.push(Vec::new());
+            for probe in &probes {
+                let expected = keys.binary_search(probe);
+                assert_eq!(leaf_search(&encoded_leaf[..], probe), expected, "encoded leaf, probe {probe:?}");
+                assert_eq!(leaf_search(&inserted[..], probe), expected, "inserted leaf, probe {probe:?}");
+                let slot = keys.partition_point(|k| k <= probe);
+                assert_eq!(branch_slot(&encoded_branch[..], probe), slot, "branch, probe {probe:?}");
+            }
         }
     }
 }

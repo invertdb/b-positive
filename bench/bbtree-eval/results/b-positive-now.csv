@@ -1,0 +1,13 @@
+map,keys,workload,threads,operations,elapsed_ns,mops
+b-positive,u64,get-half,1,2527744,1009359125,2.504
+b-positive,u64,update,1,1074432,1060548625,1.013
+b-positive,u64,scan,1,703744,1010687208,0.696
+b-positive,u64,insert,1,10000000,5609318208,1.783
+b-positive,uuid,get-half,1,2102272,1009207208,2.083
+b-positive,uuid,update,1,1095680,1065879667,1.028
+b-positive,uuid,scan,1,701184,1011549000,0.693
+b-positive,uuid,insert,1,10000000,5798096917,1.725
+b-positive,str-json,get-half,1,2285312,1009466958,2.264
+b-positive,str-json,update,1,1051648,1055004916,0.997
+b-positive,str-json,scan,1,723200,1010829667,0.715
+b-positive,str-json,insert,1,10000000,6458583333,1.548

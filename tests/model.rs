@@ -161,8 +161,8 @@ fn sorted_inserts_fill_their_pages() {
     }
     w.commit().unwrap();
     assert_eq!(db.begin_read().len(), count as u64);
-    // 16-byte key, 4-byte value: 8 bytes of entry overhead each, so 28 bytes an entry
-    let entry = 16 + 4 + 8;
+    // 16-byte key, 4-byte value: 6 bytes of entry header and a slot each
+    let entry = 16 + 4 + 6 + b_positive::page::SLOT;
     let ideal = count as u64 * entry as u64;
     let size = std::fs::metadata(&path).unwrap().len();
     assert!(size < ideal * 5 / 4, "{size} bytes for {ideal} bytes of entries: pages aren't filling");
@@ -203,7 +203,7 @@ fn sorted_batches_fill_their_pages() {
         .unwrap();
         w.commit().unwrap();
     }
-    let ideal = count as u64 * (16 + 4 + 8);
+    let ideal = count as u64 * (16 + 4 + 6 + b_positive::page::SLOT as u64);
     let size = std::fs::metadata(&path).unwrap().len();
     assert!(size < ideal * 5 / 4, "{size} bytes for {ideal} bytes of entries: pages aren't filling");
 

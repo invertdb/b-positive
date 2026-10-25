@@ -18,10 +18,13 @@ for (key, value) in r.range_from(b"h") { /* in key order */ }
 A B+tree (Bayer and McCreight, 1972; Comer, 1979) committed by shadow paging (Lorie, 1977), applied
 copy-on-write to the whole tree (Rodeh, 2008).
 
-- **Pages:** 4 KB pages in one file, memory-mapped for reading. Reads binary-search page bytes in
-  place: no node cache, no per-key objects.
-- **Nodes:** slotted pages. Variable-length keys (up to 1 KB) and values; values over 1 KB go to
-  chains of overflow pages.
+- **Pages:** 4 KB pages in one file, memory-mapped for reading. Reads search page bytes in place: no node cache,
+  no per-key objects.
+- **Nodes:** slotted pages. Variable-length keys (up to 1 KB) and values; values over 1 KB go to chains of overflow
+  pages. A page records the prefix its keys share (its first 8 bytes kept beside the header), and each slot a 2-byte
+  summary of its key past that prefix, so a search binary-searches the slot array and compares full keys only where
+  summaries tie (Bayer and Unterauer, 1977; Graefe, 2011). Keys are stored whole, so a cursor hands them out
+  borrowed from the page.
 - **Copy-on-write:** a write transaction copies the pages it changes into new pages, and edits those copies in
   place (a change a page can't hold makes it a list of entries until it splits back into pages). A commit writes
   them, then a meta page in the slot the previous commit didn't use. There are two meta pages, each
@@ -49,16 +52,17 @@ copy-on-write to the whole tree (Rodeh, 2008).
 
 | | b-positive |
 |---|---:|
-| writes | 315k/s (341k/s with mimalloc) |
-| random reads, 1 thread | 1.7–2.3M/s |
-| random reads, 8 threads | 15.6–16.9M/s |
+| writes | 349k/s (mimalloc) |
+| random reads, 1 thread | 2.1–2.4M/s |
+| random reads, 8 threads | 16.6M/s |
 | file | 256 MB |
 
 The library never sets an allocator: that's each binary's choice (`--features mimalloc` for the examples).
 
 **Writes** (`cargo run --release --features mimalloc --example writes`): 10M u64 keys inserted in random order in one
-transaction, 1.28M/s (its commit 0.2 s); 1M random updates of them in one transaction, 0.79M/s (commit 0.08 s).
-Before copied pages were edited in place and commits wrote pages in runs (#2): 0.52M/s and 0.22M/s.
+transaction, 2.1M/s (its commit 0.14 s); 1M random updates of them in one transaction, 1.04M/s (commit 0.06 s).
+Before copied pages were edited in place and commits wrote pages in runs (#2): 0.52M/s and 0.22M/s; before key
+summaries (#1): 1.28M/s and 0.79M/s.
 
 ### Against in-memory ordered maps (`bench/bbtree-eval`)
 
@@ -68,12 +72,12 @@ bbtree's benchmark (10M entries, one thread, Apple M3 Max), million operations p
 |---|---:|---:|---:|---:|
 | bbtree | 6.78 | 3.72 | 5.93 | 1.63 |
 | std `BTreeMap` | 3.72 | 2.85 | 3.46 | 0.80 |
-| b-positive | 1.65 | 1.34 | 0.93 | 0.75 |
+| b-positive | 2.50 | 1.78 | 1.01 | 0.70 |
 | scc `TreeIndex` | 1.92 | 1.96 | 2.02 | 0.44 |
 
-On string keys b-positive's lookups (1.68M/s) beat std's `BTreeMap` (1.11M/s) and every concurrent map. Writes were
-0.42M/s (inserts) and 0.10M/s (updates) before #2. What remains is searching within a page (#1) and batched lookups
-(#3); details in `bench/bbtree-eval/README.md`.
+On string keys b-positive's lookups (2.26M/s) are twice std's `BTreeMap`'s (1.11M/s) and beat every concurrent map.
+Before key summaries (#1) and in-place page edits (#2), b-positive ran 1.54 / 0.42 / 0.10 / 0.71. Batched lookups
+(#3) remain; details in `bench/bbtree-eval/README.md`.
 
 ## Not yet
 
@@ -87,6 +91,7 @@ On string keys b-positive's lookups (1.68M/s) beat std's `BTreeMap` (1.11M/s) an
 - Bayer, R., and McCreight, E. (1972). Organization and maintenance of large ordered indexes.
   *Acta Informatica* 1(3).
 - Comer, D. (1979). The ubiquitous B-tree. *ACM Computing Surveys* 11(2).
+- Bayer, R., and Unterauer, K. (1977). Prefix B-trees. *ACM Transactions on Database Systems* 2(1).
 - Graefe, G. (2011). Modern B-tree techniques. *Foundations and Trends in Databases* 3(4).
 - Lorie, R. A. (1977). Physical integrity in a large segmented database. *ACM Transactions on Database Systems*
   2(1).
