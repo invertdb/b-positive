@@ -83,7 +83,8 @@ lookups (`ReadTxn::get_many`, #3) run 1.8–2.4× single ones. The first run, be
 
 - Rebalancing of underfull branches (leaves merge; an emptied branch is removed). Trees stay
   correct, but can become less dense after heavy deletes.
-- Compaction (the file never shrinks).
+- Compaction in place: the file never shrinks while open. `Db::compact_to` writes a compact copy (entries appended
+  in order, pages full, no free pages) for the caller to swap in.
 - Typed keys and values here. Types live above this level, in introvert's order-preserving `Codec`.
 
 ## References

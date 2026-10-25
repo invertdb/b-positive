@@ -156,6 +156,35 @@ impl Db {
         ReadTxn { inner: self.inner.clone(), map, meta }
     }
 
+    /// Writes a compact copy of the last commit to `path` (replacing any file there): its entries appended in order,
+    /// so pages are full, with no free pages. A file that commits spread across its keys holds every page each commit
+    /// rewrote until a later commit reuses it, and never shrinks; its copy holds only the live tree. Readers and the
+    /// writer may go on meanwhile: the copy is of a snapshot.
+    pub fn compact_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        const BATCH: usize = 1 << 16;
+        let path = path.as_ref();
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let copy = Db::open(path, self.inner.options)?;
+        let snapshot = self.begin_read();
+        let mut w = copy.begin_write();
+        let (mut keys, mut values): (Vec<Vec<u8>>, Vec<Vec<u8>>) = (Vec::with_capacity(BATCH), Vec::with_capacity(BATCH));
+        let mut entries = snapshot.iter().peekable();
+        while entries.peek().is_some() {
+            for (key, value) in entries.by_ref().take(BATCH) {
+                keys.push(key.to_vec());
+                values.push(value.into_owned());
+            }
+            w.put_sorted(&keys, |i, _| std::mem::take(&mut values[i]))?;
+            keys.clear();
+            values.clear();
+        }
+        w.commit()?;
+        copy.inner.file.sync_all()
+    }
+
     /// The writer; waits for any other writer to finish.
     pub fn begin_write(&self) -> WriteTxn<'_> {
         let guard = self.inner.writer.lock().unwrap();

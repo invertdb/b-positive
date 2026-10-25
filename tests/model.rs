@@ -281,3 +281,27 @@ fn many_small_commits_keep_the_file_and_free_list_small() {
     let db = Db::open(&path, Options::default()).unwrap();
     assert_eq!(db.begin_read().len(), 1000, "reopens with its free list");
 }
+
+#[test]
+fn a_compact_copy_holds_the_same_entries_in_fewer_pages() {
+    // commits that each touch keys across the whole tree leave the pages they rewrote behind
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("spread.db");
+    let db = Db::open(&path, Options::default()).unwrap();
+    let mut model = BTreeMap::new();
+    for round in 0..6u32 {
+        let mut w = db.begin_write();
+        for i in (round..60_000).step_by(6) {
+            let (key, value) = (format!("{:08}", i * 7919 % 60_000).into_bytes(), vec![round as u8; 20]);
+            w.put(&key, &value).unwrap();
+            model.insert(key, value);
+        }
+        w.commit().unwrap();
+    }
+    let compact = dir.path().join("compact.db");
+    db.compact_to(&compact).unwrap();
+    let copy = Db::open(&compact, Options::default()).unwrap();
+    check(&copy.begin_read(), &model, "compact copy");
+    let (before, after) = (std::fs::metadata(&path).unwrap().len(), std::fs::metadata(&compact).unwrap().len());
+    assert!(after * 2 < before, "{after} bytes compacted from {before}");
+}
