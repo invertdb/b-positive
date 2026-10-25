@@ -79,6 +79,10 @@ On string keys b-positive's lookups (2.52M/s) are 1.8× std's `BTreeMap`'s and a
 lookups (`ReadTxn::get_many`, #3) run 1.8–2.4× single ones. The first run, before #1-#3, had b-positive at 1.54 / -
 / 0.42 / 0.10 / 0.71. Details in `bench/bbtree-eval/README.md`.
 
+Against SQLite in the same harness and under the same rules (one file, a `WITHOUT ROWID` table, WAL without fsync,
+one transaction per workload, mmap and a large page cache), b-positive is 2.1–2.2× faster on lookups (4.3–4.8×
+batched), 1.9–2.2× on inserts, 2.0–2.3× on updates and 3.0–3.3× on scans.
+
 ## Not yet
 
 - Rebalancing of underfull branches (leaves merge; an emptied branch is removed). Trees stay
