@@ -22,7 +22,7 @@ mkdir -p "$work"
 git -C "$work/bbtree" checkout -q 6619c4e926f701b0e28f80e47c01472ab09f13ae
 git -C "$work/bbtree-eval" checkout -q -f 01229ec0c07c30a89ae379de3179f4ce5b3b9361
 sed "s|@B_POSITIVE@|$b_positive|" "$here/harness.patch" | git -C "$work/bbtree-eval" apply
-cp "$here/b_positive.rs" "$work/bbtree-eval/src/concurrent_maps/"
+cp "$here/b_positive.rs" "$here/sqlite.rs" "$work/bbtree-eval/src/concurrent_maps/"
 (cd "$work/bbtree-eval" && cargo build --release --features blog --bin bbtree-scaling)
 
 bin=$work/bbtree-eval/target/release/bbtree-scaling
@@ -33,7 +33,7 @@ for key in "${keys[@]}"; do
         --workloads get-half,get-half-batch,insert,insert-batch,update,scan --measure throughput --seconds 1 \
         --out "$work/results/$key-bbtree"
     ${GUARD:-} "$bin" --entries "$entries" --threads 1 --keys "$key" \
-        --maps b-positive,std-btree,crossbeam-skipmap,scc-treeindex,concurrent-map,std-hash \
+        --maps b-positive,sqlite,std-btree,crossbeam-skipmap,scc-treeindex,concurrent-map,std-hash \
         --workloads get-half,insert,update,scan --measure throughput --seconds 1 --out "$work/results/$key"
     ${GUARD:-} "$bin" --entries "$entries" --threads 1 --keys "$key" --maps b-positive \
         --workloads get-half-batch --measure throughput --seconds 1 --out "$work/results/$key-b-positive-batch"

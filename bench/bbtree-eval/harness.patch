@@ -1,17 +1,18 @@
 diff --git a/Cargo.toml b/Cargo.toml
-index 923a528..0b86436 100644
+index 923a528..936018c 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
-@@ -10,6 +10,7 @@ default-run = "bbtree-bench"
+@@ -10,6 +10,8 @@ default-run = "bbtree-bench"
  # The library under evaluation: the checkout beside this repository.
  bbtree = { path = "../bbtree" }
  bytes = "1"
 +b-positive = { path = "@B_POSITIVE@" }
++rusqlite = { version = "0.32.1", features = ["bundled"] }
  # Pins `bbtree-scaling`'s workers to CPUs (`sched_setaffinity`).
  libc = "0.2"
  mimalloc = "0.1"
 diff --git a/src/concurrent_maps.rs b/src/concurrent_maps.rs
-index a13397a..e8df387 100644
+index a13397a..a926747 100644
 --- a/src/concurrent_maps.rs
 +++ b/src/concurrent_maps.rs
 @@ -29,6 +29,9 @@ pub(crate) trait ScalingKey:
@@ -62,17 +63,19 @@ index a13397a..e8df387 100644
      fn dump_line(&self, dump: &mut String) {
          assert!(
              !self.contains('\n'),
-@@ -201,6 +216,8 @@ pub(crate) fn sum_of_first(entries: impl Iterator<Item = u64>, count: usize) ->
+@@ -201,6 +216,10 @@ pub(crate) fn sum_of_first(entries: impl Iterator<Item = u64>, count: usize) ->
  
  // Other crates' maps, each where its Cargo feature is on. They come after
  // `shared_by_reference!`, which they use.
 +mod b_positive;
 +pub(crate) use self::b_positive::BPositive;
++mod sqlite;
++pub(crate) use self::sqlite::Sqlite;
  #[cfg(feature = "artmap")]
  mod artmap;
  #[cfg(feature = "concurrent-map")]
 diff --git a/src/scaling.rs b/src/scaling.rs
-index 114926c..f2692ca 100644
+index 114926c..8255157 100644
 --- a/src/scaling.rs
 +++ b/src/scaling.rs
 @@ -72,7 +72,7 @@ use crate::concurrent_maps::DashMapOf;
@@ -80,24 +83,28 @@ index 114926c..f2692ca 100644
  #[cfg(feature = "scc")]
  use crate::concurrent_maps::TreeIndexOf;
 -use crate::concurrent_maps::{MapHandle, Owned, ScalingKey, SharedMap};
-+use crate::concurrent_maps::{BPositive, MapHandle, Owned, ScalingKey, SharedMap};
++use crate::concurrent_maps::{BPositive, Sqlite, MapHandle, Owned, ScalingKey, SharedMap};
  use crate::datasets::{DataDirectory, DataFile, KeyList};
  use crate::keys::KeyMaker;
  use crate::latency::{LatencyHistogram, TickClock};
-@@ -642,6 +642,7 @@ impl ScalingRun {
+@@ -642,6 +642,8 @@ impl ScalingRun {
          <Owned<unsync::BBTreeMap<u64, u64>> as SharedMap<u64>>::NAME,
          <Owned<BTreeMap<u64, u64>> as SharedMap<u64>>::NAME,
          <Owned<HashMap<u64, u64>> as SharedMap<u64>>::NAME,
 +        <BPositive as SharedMap<u64>>::NAME,
++        <Sqlite as SharedMap<u64>>::NAME,
          <BBTreeMap<u64, u64> as SharedMap<u64>>::NAME,
          <RwLock<unsync::BBTreeMap<u64, u64>> as SharedMap<u64>>::NAME,
          <RwLock<BTreeMap<u64, u64>> as SharedMap<u64>>::NAME,
-@@ -834,6 +835,9 @@ impl ScalingRun {
+@@ -834,6 +836,12 @@ impl ScalingRun {
          if self.picks(<Owned<HashMap<K, u64>> as SharedMap<K>>::NAME) {
              self.measure::<K, Owned<HashMap<K, u64>>>(keys);
          }
 +        if self.picks(<BPositive as SharedMap<K>>::NAME) {
 +            self.measure::<K, BPositive>(keys);
++        }
++        if self.picks(<Sqlite as SharedMap<K>>::NAME) {
++            self.measure::<K, Sqlite>(keys);
 +        }
          if self.picks(<BBTreeMap<K, u64> as SharedMap<K>>::NAME) {
              self.measure::<K, BBTreeMap<K, u64>>(keys);

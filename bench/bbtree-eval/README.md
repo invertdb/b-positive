@@ -11,9 +11,9 @@ bench/bbtree-eval/run.sh                 # u64, uuid and str-json keys; results 
 
 - `run.sh` clones bbtree (6619c4e, the post's version; its API has changed since) and bbtree-eval (01229ec), applies
   `harness.patch` (registers the map; `ScalingKey::ordered_bytes`, a key's bytes in its order) and adds
-  `b_positive.rs`, the adapter.
+  `b_positive.rs`, the adapter, and `sqlite.rs`, SQLite's (below).
 - `results/`: the run below, one CSV per key set, and the machine; `results/first-run/`, the first (before #1-#3, on
-  the same machine in a slower state: every map ran about 25% slower).
+  the same machine in a slower state: every map ran about 25% slower); `results/sqlite/`, the SQLite run.
 
 ## What is compared
 
@@ -77,6 +77,40 @@ once, on its own machine, and 45 ms for std's `BTreeMap` read back from a file.
   and crossbeam's on every key set.
 - **Writes:** inserts are 2.0–2.7× slower than bbtree's and updates 6–7×. Copy-on-write copies each page a
   transaction changes and the path above it, and a commit writes them, which a map in memory never does.
+
+## Against SQLite
+
+The maps above keep nothing on disk. SQLite does what b-positive does: one file, a B-tree in pages, transactions that
+survive a crash. Its adapter (`sqlite.rs`, SQLite 3.46.0 bundled by rusqlite 0.32.1) keeps b-positive's rules:
+
+- keys in their order-preserving bytes as the primary key of a `WITHOUT ROWID` table, so the B-tree holds the entries
+  themselves; values as integers; statements prepared once and cached;
+- a workload's writes in one transaction, committed when it ends, inside the timed region; reads in one read
+  transaction;
+- the WAL journal with `synchronous=OFF` (written to the OS, no fsync, as b-positive's `Process`); 4 KB pages; mmap
+  and a 4 GB page cache, so it reads from memory as b-positive does;
+- updates as one `UPDATE ... SET value = value + 1`; inserts as an upsert. SQLite has no batched lookup, so its batched
+  cell is single lookups.
+
+One session, the same harness and workloads; std's `BTreeMap` ran beside them and was 5–20% slower than in the table
+above, so compare within this table. Million operations per second.
+
+| Keys | Map | Lookups | Batched | Inserts | Updates | Scans |
+|---|---|---:|---:|---:|---:|---:|
+| u64 | **b-positive** | **2.76** | **5.57** | **1.93** | **1.18** | **0.83** |
+|  | SQLite | 1.26 | 1.30 | 1.04 | 0.59 | 0.26 |
+|  | std `BTreeMap` | 3.96 | 3.86 | 3.45 | 3.58 | 0.85 |
+| uuid | **b-positive** | **2.69** | **6.02** | **1.88** | **1.15** | **0.71** |
+|  | SQLite | 1.26 | 1.25 | 0.88 | 0.49 | 0.24 |
+|  | std `BTreeMap` | 2.38 | 2.54 | 3.06 | 2.49 | 0.54 |
+| str-json | **b-positive** | **2.41** | **5.05** | **1.74** | **1.10** | **0.78** |
+|  | SQLite | 1.09 | 1.10 | 0.79 | 0.48 | 0.24 |
+|  | std `BTreeMap` | 1.13 | 1.10 | 1.35 | 0.92 | 0.43 |
+
+b-positive is 2.1–2.2× SQLite on lookups (4.3–4.8× batched), 1.9–2.2× on inserts, 2.0–2.3× on updates and 3.0–3.3×
+on scans. Much of SQLite's cost per operation is outside its B-tree: binding parameters, its bytecode engine, and
+copying each row out (b-positive reads values in place). SQLite is the more complete system (SQL, any schema,
+secondary indexes, processes sharing one file); the comparison says what a key/value B-tree pays for going through it.
 
 ## What changed, and why bbtree is still faster
 

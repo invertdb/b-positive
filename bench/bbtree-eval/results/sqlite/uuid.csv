@@ -1,0 +1,16 @@
+map,keys,workload,threads,operations,elapsed_ns,mops
+std-btree,uuid,get-half,1,2391040,1004606875,2.380
+std-btree,uuid,get-half-batch,1,2555904,1007200875,2.538
+std-btree,uuid,update,1,2495744,1003118959,2.488
+std-btree,uuid,scan,1,544512,1003791667,0.542
+std-btree,uuid,insert,1,10000000,3265208084,3.063
+b-positive,uuid,get-half,1,2699776,1005022208,2.686
+b-positive,uuid,get-half-batch,1,6045696,1003936417,6.022
+b-positive,uuid,update,1,1218304,1059884958,1.149
+b-positive,uuid,scan,1,716800,1009492958,0.710
+b-positive,uuid,insert,1,10000000,5320335125,1.880
+sqlite,uuid,get-half,1,1267712,1007157125,1.259
+sqlite,uuid,get-half-batch,1,1261568,1010850708,1.248
+sqlite,uuid,update,1,713216,1447602708,0.493
+sqlite,uuid,scan,1,246272,1007891875,0.244
+sqlite,uuid,insert,1,10000000,11418726750,0.876

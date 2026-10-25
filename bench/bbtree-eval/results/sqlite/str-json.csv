@@ -1,0 +1,16 @@
+map,keys,workload,threads,operations,elapsed_ns,mops
+std-btree,str-json,get-half,1,1133312,1007087958,1.125
+std-btree,str-json,get-half-batch,1,1114112,1016405834,1.096
+std-btree,str-json,update,1,929280,1007045250,0.923
+std-btree,str-json,scan,1,426752,1003900959,0.425
+std-btree,str-json,insert,1,10000000,7386119625,1.354
+b-positive,str-json,get-half,1,2435840,1010279625,2.411
+b-positive,str-json,get-half-batch,1,5062656,1003107125,5.047
+b-positive,str-json,update,1,1167104,1056716500,1.104
+b-positive,str-json,scan,1,790016,1011191000,0.781
+b-positive,str-json,insert,1,10000000,5757555750,1.737
+sqlite,str-json,get-half,1,1103104,1008340125,1.094
+sqlite,str-json,get-half-batch,1,1114112,1017365042,1.095
+sqlite,str-json,update,1,641024,1334831583,0.480
+sqlite,str-json,scan,1,240896,1007146709,0.239
+sqlite,str-json,insert,1,10000000,12656082834,0.790
