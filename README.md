@@ -34,7 +34,7 @@ copy-on-write to the whole tree (Rodeh, 2008).
   the process dying. `Durability::Full` forces data, then the meta page, to stable storage, which
   survives power loss.
 - **Readers:** snapshots (`ReadTxn`). Any number, on any threads, never blocked by or blocking the
-  one writer.
+  one writer. `get_many` looks up a batch of keys together, prefetching, so their memory waits overlap.
 - **Free pages:** reused only once no open snapshot can still see them. The free list is persisted
   as a page chain written fresh by each commit.
 
@@ -66,18 +66,18 @@ summaries (#1): 1.28M/s and 0.79M/s.
 
 ### Against in-memory ordered maps (`bench/bbtree-eval`)
 
-bbtree's benchmark (10M entries, one thread, Apple M3 Max), million operations per second:
+bbtree's benchmark (10M entries, one thread, Apple M3 Max, every map in one session), million operations per second:
 
-| u64 keys | Lookups | Inserts | Updates | Scans |
-|---|---:|---:|---:|---:|
-| bbtree | 6.78 | 3.72 | 5.93 | 1.63 |
-| std `BTreeMap` | 3.72 | 2.85 | 3.46 | 0.80 |
-| b-positive | 2.50 | 1.78 | 1.01 | 0.70 |
-| scc `TreeIndex` | 1.92 | 1.96 | 2.02 | 0.44 |
+| u64 keys | Lookups | Batched lookups | Inserts | Updates | Scans |
+|---|---:|---:|---:|---:|---:|
+| bbtree | 8.92 | 18.15 | 5.86 | 9.14 | 2.02 |
+| std `BTreeMap` | 4.33 | 4.25 | 4.05 | 4.01 | 0.89 |
+| b-positive | 3.00 | 5.51 | 2.18 | 1.25 | 0.84 |
+| scc `TreeIndex` | 2.60 | | 2.57 | 2.62 | 0.53 |
 
-On string keys b-positive's lookups (2.26M/s) are twice std's `BTreeMap`'s (1.11M/s) and beat every concurrent map.
-Before key summaries (#1) and in-place page edits (#2), b-positive ran 1.54 / 0.42 / 0.10 / 0.71. Batched lookups
-(#3) remain; details in `bench/bbtree-eval/README.md`.
+On string keys b-positive's lookups (2.52M/s) are 1.8× std's `BTreeMap`'s and ahead of every concurrent map. Batched
+lookups (`ReadTxn::get_many`, #3) run 1.8–2.4× single ones. The first run, before #1-#3, had b-positive at 1.54 / -
+/ 0.42 / 0.10 / 0.71. Details in `bench/bbtree-eval/README.md`.
 
 ## Not yet
 

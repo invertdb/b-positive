@@ -107,6 +107,15 @@ impl<K: ScalingKey> MapHandle<K> for BPositiveHandle<'_> {
         self.reading(|r| r.get(&key.ordered_bytes()).map(|v| value_of(&v)))
     }
 
+    /// `ReadTxn::get_many`: the lookups go down the tree together, prefetching.
+    fn get_batch<const N: usize>(&self, keys: [&K; N]) -> [Option<u64>; N] {
+        let bytes = keys.map(|key| key.ordered_bytes());
+        self.reading(|r| {
+            let found = r.get_many(&bytes);
+            std::array::from_fn(|i| found[i].as_ref().map(|v| value_of(v)))
+        })
+    }
+
     fn bump(&self, key: &K) {
         let key = key.ordered_bytes();
         self.writing(|w| {

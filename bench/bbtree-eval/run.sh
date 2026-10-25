@@ -35,5 +35,7 @@ for key in "${keys[@]}"; do
     ${GUARD:-} "$bin" --entries "$entries" --threads 1 --keys "$key" \
         --maps b-positive,std-btree,crossbeam-skipmap,scc-treeindex,concurrent-map,std-hash \
         --workloads get-half,insert,update,scan --measure throughput --seconds 1 --out "$work/results/$key"
+    ${GUARD:-} "$bin" --entries "$entries" --threads 1 --keys "$key" --maps b-positive \
+        --workloads get-half-batch --measure throughput --seconds 1 --out "$work/results/$key-b-positive-batch"
 done
 echo "results in $work/results"

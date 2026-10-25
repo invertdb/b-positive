@@ -43,6 +43,15 @@ fn check(snapshot: &ReadTxn, model: &BTreeMap<Vec<u8>, Vec<u8>>, context: &str) 
         assert_eq!(snapshot.get(k).as_deref(), Some(v.as_slice()), "{context}: get");
     }
     assert_eq!(snapshot.get(b"absent"), None);
+    // many at once, present and absent, in no particular order
+    let mut probes: Vec<Vec<u8>> = model.keys().step_by(11).cloned().collect();
+    probes.extend(model.keys().step_by(13).map(|k| [k.as_slice(), b"~"].concat()));
+    probes.push(b"absent".to_vec());
+    probes.reverse();
+    let many = snapshot.get_many(&probes);
+    for (probe, value) in probes.iter().zip(&many) {
+        assert_eq!(value.as_deref(), model.get(probe).map(Vec::as_slice), "{context}: get_many");
+    }
 }
 
 #[test]

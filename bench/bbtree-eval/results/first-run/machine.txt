@@ -1,0 +1,6 @@
+Apple M3 Max
+36 GB
+26.5.2
+rustc 1.99.0 (b940084d7 2026-09-28) (Homebrew)
+bbtree 6619c4e, bbtree-eval 01229ec, b-positive 0d32e0d
+2026-10-25; swap nearly full during the run; each cell once

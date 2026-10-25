@@ -186,6 +186,27 @@ fn page_of(map: &Mmap, id: PageId) -> &[u8] {
     &map[id as usize * PAGE_SIZE..(id as usize + 1) * PAGE_SIZE]
 }
 
+/// Asks memory for the start of a node page (header, prefix and the first slots, where a search begins) without
+/// waiting for it.
+#[inline(always)]
+fn prefetch_page(page: &[u8]) {
+    for line in (0..512).step_by(64) {
+        let at = page[line..].as_ptr();
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: a prefetch is a hint: it reads nothing and can't fault, and `at` is inside the mapped page.
+        unsafe {
+            std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) at, options(nostack, preserves_flags, readonly));
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: as above.
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(at as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = at;
+    }
+}
+
 fn read_overflow(map: &Mmap, mut page: PageId, len: u32) -> Vec<u8> {
     let mut value = Vec::with_capacity(len as usize);
     while page != 0 {
@@ -251,6 +272,34 @@ impl ReadTxn {
                 Err(_) => None,
             };
         }
+    }
+
+    /// The values of many keys at once, in their order. The lookups go down the tree together, a level at a time,
+    /// each prefetching the page it reads next while the others search, so their waits for memory overlap instead of
+    /// adding up. Worth it from a few keys on; sorted keys also share pages.
+    pub fn get_many<K: AsRef<[u8]>>(&self, keys: &[K]) -> Vec<Option<Cow<'_, [u8]>>> {
+        let root = self.meta.root;
+        if root == 0 {
+            return keys.iter().map(|_| None).collect();
+        }
+        let mut at: Vec<PageId> = vec![root; keys.len()];
+        let mut found = Vec::with_capacity(keys.len());
+        // every leaf is as deep as every other, so the lookups reach their leaves together
+        while !at.is_empty() && kind(page_of(&self.map, at[0])) == KIND_BRANCH {
+            for (id, key) in at.iter_mut().zip(keys) {
+                let page = page_of(&self.map, *id);
+                *id = branch_slot_child(page, branch_slot(page, key.as_ref()));
+                prefetch_page(page_of(&self.map, *id));
+            }
+        }
+        for (&id, key) in at.iter().zip(keys) {
+            let page = page_of(&self.map, id);
+            found.push(leaf_search(page, key.as_ref()).ok().map(|i| match leaf_value(page, i) {
+                ValueRef::Inline(bytes) => Cow::Borrowed(bytes),
+                ValueRef::Overflow { page, len } => Cow::Owned(read_overflow(&self.map, page, len)),
+            }));
+        }
+        found
     }
 
     /// Keys from `start` (inclusive) on, in order, with their values.

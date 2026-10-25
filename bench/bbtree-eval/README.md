@@ -12,7 +12,8 @@ bench/bbtree-eval/run.sh                 # u64, uuid and str-json keys; results 
 - `run.sh` clones bbtree (6619c4e, the post's version; its API has changed since) and bbtree-eval (01229ec), applies
   `harness.patch` (registers the map; `ScalingKey::ordered_bytes`, a key's bytes in its order) and adds
   `b_positive.rs`, the adapter.
-- `results/`: the run below, one CSV per key set, and the machine.
+- `results/`: the run below, one CSV per key set, and the machine; `results/first-run/`, the first (before #1-#3, on
+  the same machine in a slower state: every map ran about 25% slower).
 
 ## What is compared
 
@@ -21,78 +22,85 @@ b-positive is a persistent store: byte-string keys in 4 KB pages of one memory-m
 copy-on-write and committed so a crash leaves the last commit whole.
 
 **The adapter:** a workload's writes are one write transaction, committed (durability `Process`: written to the OS,
-not forced to disk) when the workload ends, inside its timed region. Reads go through one snapshot. Keys are their
-order-preserving bytes (big-endian integers, a UUID's bytes, a string's UTF-8), values 8 little-endian bytes.
+not forced to disk) when the workload ends, inside its timed region. Reads go through one snapshot; batched lookups
+through `ReadTxn::get_many`. Keys are their order-preserving bytes (big-endian integers, a UUID's bytes, a string's
+UTF-8), values 8 little-endian bytes.
 
 **The workloads** (bbtree-eval's): 10M entries built in random order; lookups of which half miss; inserts of every
 key into an empty map; updates (add one to a value); scans of 100 entries from a random key; one thread, one second
-per cell (inserts: all 10M). bbtree also through its batch calls (64 lookups, 16 inserts a call).
+per cell (inserts: all 10M). Batched: 64 lookups a call (bbtree's `get_many_copied`, b-positive's `get_many`), 16
+inserts (bbtree's `insert_many`).
 
 ## Results
 
-Apple M3 Max (36 GB), macOS 26.5, Rust 1.99, mimalloc; each cell run once, with the machine's swap nearly full.
-Million operations per second, higher is better. b-positive's bold rows are after #1 (key summaries) and #2 (copied
-pages edited in place, commits written in runs), `results/b-positive-now.csv`; below them, the first run's.
+Apple M3 Max (36 GB), macOS 26.5, Rust 1.99, mimalloc; every map in one session, each cell once (cells vary about
+±10% run to run here). Million operations per second, higher is better.
 
 | Keys | Map | Lookups | Inserts | Updates | Scans |
 |---|---|---:|---:|---:|---:|
-| u64 | bbtree | 6.78 | 3.72 | 5.93 | 1.63 |
-| | bbtree, batched | 12.29 | 7.51 | | |
-| | std `BTreeMap` | 3.72 | 2.85 | 3.46 | 0.80 |
-| | **b-positive** | **2.50** | **1.78** | **1.01** | **0.70** |
-| | b-positive, first run | 1.54 | 0.42 | 0.10 | 0.71 |
-| | scc `TreeIndex` | 1.92 | 1.96 | 2.02 | 0.44 |
-| | concurrent-map | 2.27 | 1.70 | 1.05 | 1.03 |
-| | crossbeam `SkipMap` | 0.81 | 0.88 | 0.84 | 0.09 |
-| | std `HashMap` (no order) | 18.46 | 15.30 | 16.66 | |
-| uuid | bbtree | 7.08 | 3.72 | 6.44 | 1.34 |
-| | bbtree, batched | 13.15 | 6.74 | | |
-| | std `BTreeMap` | 2.30 | 2.47 | 2.37 | 0.51 |
-| | **b-positive** | **2.08** | **1.72** | **1.03** | **0.69** |
-| | b-positive, first run | 1.51 | 0.42 | 0.10 | 0.67 |
-| | scc `TreeIndex` | 1.71 | 1.64 | 1.73 | 0.45 |
-| | concurrent-map | 1.44 | 1.11 | 0.85 | 0.78 |
-| | crossbeam `SkipMap` | 0.63 | 0.74 | 0.68 | 0.09 |
-| | std `HashMap` (no order) | 13.39 | 12.70 | 11.72 | |
-| str-json | bbtree | 4.86 | 2.86 | 4.73 | 1.00 |
-| | bbtree, batched | 8.98 | 5.03 | | |
-| | std `BTreeMap` | 1.11 | 1.34 | 1.08 | 0.39 |
-| | **b-positive** | **2.26** | **1.55** | **1.00** | **0.72** |
-| | b-positive, first run | 1.57 | 0.42 | 0.09 | 0.67 |
-| | scc `TreeIndex` | 0.86 | 1.11 | 0.84 | 0.33 |
-| | concurrent-map | 0.65 | 0.33 | 0.25 | 0.20 |
-| | crossbeam `SkipMap` | 0.39 | 0.48 | 0.38 | 0.08 |
-| | std `HashMap` (no order) | 14.12 | 11.97 | 8.37 | |
+| u64 | bbtree | 8.92 | 5.86 | 9.14 | 2.02 |
+|  | bbtree, batched | 18.15 | 10.05 |  |  |
+|  | std `BTreeMap` | 4.33 | 4.05 | 4.01 | 0.89 |
+|  | **b-positive** | **3.00** | **2.18** | **1.25** | **0.84** |
+|  | **b-positive, batched** | **5.51** |  |  |  |
+|  | scc `TreeIndex` | 2.60 | 2.57 | 2.62 | 0.53 |
+|  | concurrent-map | 3.23 | 2.12 | 1.42 | 1.34 |
+|  | crossbeam `SkipMap` | 0.97 | 1.19 | 1.01 | 0.10 |
+|  | std `HashMap` (no order) | 31.88 | 19.42 | 20.50 |  |
+| uuid | bbtree | 7.92 | 5.01 | 7.98 | 1.60 |
+|  | bbtree, batched | 15.21 | 8.84 |  |  |
+|  | std `BTreeMap` | 2.91 | 3.07 | 2.83 | 0.55 |
+|  | **b-positive** | **2.64** | **2.02** | **1.21** | **0.76** |
+|  | **b-positive, batched** | **6.30** |  |  |  |
+|  | scc `TreeIndex` | 2.01 | 2.05 | 1.99 | 0.47 |
+|  | concurrent-map | 1.58 | 1.41 | 0.91 | 0.94 |
+|  | crossbeam `SkipMap` | 0.82 | 0.98 | 0.82 | 0.10 |
+|  | std `HashMap` (no order) | 22.60 | 16.80 | 17.71 |  |
+| str-json | bbtree | 6.76 | 3.87 | 6.66 | 1.22 |
+|  | bbtree, batched | 10.64 | 6.68 |  |  |
+|  | std `BTreeMap` | 1.44 | 1.67 | 1.37 | 0.47 |
+|  | **b-positive** | **2.52** | **1.91** | **1.10** | **0.83** |
+|  | **b-positive, batched** | **4.83** |  |  |  |
+|  | scc `TreeIndex` | 1.07 | 1.30 | 1.01 | 0.38 |
+|  | concurrent-map | 0.77 | 0.40 | 0.27 | 0.24 |
+|  | crossbeam `SkipMap` | 0.52 | 0.65 | 0.53 | 0.10 |
+|  | std `HashMap` (no order) | 17.04 | 13.78 | 9.63 |  |
 
 **Restart to first answer** (the post's bbtree-mmap card): b-positive opens a 10M-entry file (u64 keys, 230 MB) and
 answers a lookup in 35–72 µs from the page cache. The post gives about 18 µs for bbtree-mmap, a read-only file written
 once, on its own machine, and 45 ms for std's `BTreeMap` read back from a file.
 
-- **Reads:** bbtree's lookups are 2.1–3.4× faster (4.5× before #1) and its scans about 2×. b-positive's lookups
-  don't slow down on string keys (they sit flat in the page, not behind a pointer): there they are twice std's
-  `BTreeMap`'s and ahead of every concurrent map; on integers they beat scc and concurrent-map and trail std's
-  `BTreeMap` on u64 only. Its scans beat std's, scc's and crossbeam's everywhere. Lookups of a run vary about ±10%
-  here.
-- **Writes:** inserts are about 2× slower than bbtree's and updates 6× (they were 7–9× and 60× before #2, when the
-  writer decoded every page it copied into a vector of owned keys and a commit wrote pages one at a time, in hash
-  order). Copy-on-write still copies each page a transaction changes and the path above it, and commits write them.
-- The adapter allocates each u64 key's bytes (a small cost on the u64 rows only). The fourth key set of the post,
-  Wikipedia titles, needs bbtree-eval's `fetch` and isn't run.
+- **Reads:** bbtree's lookups are 2.7–3.0× faster, batched or not, and its scans 1.5–2.4×. b-positive's lookups
+  barely slow down on string keys (they sit flat in the page, not behind a pointer): on str-json they are 1.8× std's
+  `BTreeMap`'s and 2.4× scc's; on uuid about level with std's and ahead of the concurrent maps; on u64 behind std's
+  and concurrent-map. Batched, they beat std's `BTreeMap` on every key set (1.3–3.4×). Its scans beat std's, scc's
+  and crossbeam's on every key set.
+- **Writes:** inserts are 2.0–2.7× slower than bbtree's and updates 6–7×. Copy-on-write copies each page a
+  transaction changes and the path above it, and a commit writes them, which a map in memory never does.
 
-## Why bbtree is faster, and what carries over
+## What changed, and why bbtree is still faster
+
+The first run had b-positive at 1.5–1.6M lookups/s, 0.42M inserts/s and 0.10M updates/s (bbtree 4–4.5× ahead on
+lookups, 60× on updates). Three changes, each checked against every service's regression benchmark:
+
+| | What | Effect |
+|---|---|---|
+| #2 | copied pages edited in place instead of decoded into vectors of owned keys; commits write pages in sorted runs | `examples/writes`: inserts 0.52 -> 1.28M/s, updates 0.22 -> 0.79M/s |
+| #1 | slots carry a 2-byte key summary past the page's shared prefix; searches binary-search the slot array and compare full keys only on ties (file format 2) | lookups about +50%; `examples/writes`: inserts 1.28 -> 2.1M/s, updates 0.79 -> 1.04M/s |
+| #3 | `ReadTxn::get_many`: a batch goes down the tree together, a level at a time, prefetching each next page | batched lookups 1.8–2.4× single ones |
 
 It is not B-tree against B+tree: bbtree also keeps every value in a leaf (its separators are keys moved up, not
-copies). The differences:
+copies). What still differs:
 
-| | bbtree | b-positive | Fix |
-|---|---|---|---|
-| Search in a node | a dense array of 2–8-byte key summaries, counted in one pass with vector compares; full keys only for ties | since #1, a binary search of 2-byte summaries in the slot array; full keys only for ties (a one-pass count over all slots measured slower here: it reads every slot's cache line) | done (#1) |
-| Shared prefixes | skipped, per node (from its fences) and per map | since #1, skipped per page (its keys' shared prefix, its first 8 bytes beside the header); keys stay whole, so the cursor still borrows them | done (#1); truncating stored keys is left for later |
-| Key types | layouts specialized by type | byte strings | none: types belong to introvert's codecs |
-| Batches | interleaved searches with prefetching (1.8×) | one `get` at a time | `get_many` (b-positive#3) |
-| Writes | in place, in memory | copy-on-write, committed to a file; copied pages edited in place (since #2) | — |
-| Durability, snapshots, restart | none (bbtree-mmap: a read-only file written once) | crash-safe commits, snapshot readers, instant open | — |
+| | bbtree | b-positive |
+|---|---|---|
+| Search in a node | 2–8-byte key summaries counted with vector compares | 2-byte summaries, binary-searched (a one-pass count over every slot measured slower here: it reads every slot's cache line) |
+| Shared prefixes | per node, from its fences (deeper nodes skip more), and per map | per page, its keys' shared prefix |
+| Key types | layouts specialized by type | byte strings (types belong to introvert's codecs) |
+| Node memory | heap nodes sized for the cache | 4 KB pages read through mmap |
+| Writes | in place, in memory | copy-on-write, committed to a file |
+| Durability, snapshots, restart | none (bbtree-mmap: a read-only file written once) | crash-safe commits, snapshot readers, instant open |
 
-None of the fixes changes what b-positive is: commits stay copy-on-write, readers stay lock-free snapshots, keys stay
-byte strings read in place. #1 changes the page format. Writes stay slower than an in-memory map's: a commit copies
-and writes pages, which a map in memory never does.
+None of the changes altered what b-positive is: commits stay copy-on-write, readers stay lock-free snapshots, keys stay
+byte strings read in place. Left for later: truncating stored keys (smaller pages for long shared prefixes, at the
+cost of cursors borrowing keys) and fence prefixes.
