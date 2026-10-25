@@ -391,7 +391,7 @@ impl<'db> WriteTxn<'db> {
         if self.dirty.contains_key(&id) {
             return id;
         }
-        let node = Node::decode(page_of(&self.map, id));
+        let node = Node::Page(copy_page(page_of(&self.map, id)));
         let new = self.alloc();
         self.dirty.insert(new, node);
         self.released.push(id);
@@ -432,12 +432,12 @@ impl<'db> WriteTxn<'db> {
         if value.len() <= MAX_INLINE_VALUE { Value::Inline(value) } else { self.store_value(&value) }
     }
 
-    fn read_value(&self, value: &Value) -> Vec<u8> {
-        match value {
-            Value::Inline(bytes) => bytes.clone(),
-            Value::Overflow { page, len } => {
-                let mut out = Vec::with_capacity(*len as usize);
-                let mut next = *page;
+    fn read_value(&self, value: &ValueRef) -> Vec<u8> {
+        match *value {
+            ValueRef::Inline(bytes) => bytes.to_vec(),
+            ValueRef::Overflow { page, len } => {
+                let mut out = Vec::with_capacity(len as usize);
+                let mut next = page;
                 while next != 0 {
                     let p: &[u8] = match self.overflow.get(&next) {
                         Some(p) => p,
@@ -458,14 +458,10 @@ impl<'db> WriteTxn<'db> {
         }
         loop {
             if let Some(node) = self.dirty.get(&id) {
-                match node {
-                    Node::Branch { leftmost, entries } => {
-                        let slot = entries.partition_point(|(k, _)| k.as_slice() <= key);
-                        id = if slot == 0 { *leftmost } else { entries[slot - 1].1 };
-                    }
-                    Node::Leaf(entries) => {
-                        return entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)).ok().map(|i| self.read_value(&entries[i].1));
-                    }
+                if node.is_branch() {
+                    id = node.child(node.child_slot(key));
+                } else {
+                    return node.leaf_get(key).map(|v| self.read_value(&v));
                 }
             } else {
                 let page = page_of(&self.map, id);
@@ -487,19 +483,15 @@ impl<'db> WriteTxn<'db> {
         let mut id = self.writable(self.meta.root);
         self.meta.root = id;
         loop {
-            let (slot, child) = match self.dirty.get(&id).unwrap() {
-                Node::Branch { leftmost, entries } => {
-                    let slot = entries.partition_point(|(k, _)| k.as_slice() <= key);
-                    (slot, if slot == 0 { *leftmost } else { entries[slot - 1].1 })
-                }
-                Node::Leaf(_) => return (path, id),
-            };
-            let child = self.writable(child);
-            match self.dirty.get_mut(&id).unwrap() {
-                Node::Branch { leftmost, entries } => {
-                    if slot == 0 { *leftmost = child } else { entries[slot - 1].1 = child }
-                }
-                Node::Leaf(_) => unreachable!(),
+            let node = &self.dirty[&id];
+            if !node.is_branch() {
+                return (path, id);
+            }
+            let slot = node.child_slot(key);
+            let old = node.child(slot);
+            let child = self.writable(old);
+            if child != old {
+                self.dirty.get_mut(&id).unwrap().set_child(slot, child);
             }
             path.push((id, slot));
             id = child;
@@ -511,33 +503,19 @@ impl<'db> WriteTxn<'db> {
         if key.len() > MAX_KEY {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("key longer than {MAX_KEY} bytes")));
         }
-        let value = self.store_value(value);
+        // a value that fits its leaf goes in from the caller's bytes; a longer one to overflow pages first
+        let overflow = (value.len() > MAX_INLINE_VALUE).then(|| self.store_value(value));
+        let value = overflow.as_ref().map_or(ValueRef::Inline(value), Value::as_ref);
         if self.meta.root == 0 {
             let id = self.alloc();
-            self.dirty.insert(id, Node::Leaf(vec![(key.to_vec(), value)]));
+            self.dirty.insert(id, Node::Page(new_page(KIND_LEAF)));
             self.meta.root = id;
-            self.meta.entries += 1;
-            return Ok(());
         }
 
         let (path, leaf) = self.writable_path(key);
         // whether the key landed at the node's right edge: a sorted bulk load appends, and an appended node splits
         // so the left half stays full (see `split`)
-        let appended;
-        let old = match self.dirty.get_mut(&leaf).unwrap() {
-            Node::Leaf(entries) => match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
-                Ok(i) => {
-                    appended = i + 1 == entries.len();
-                    Some(std::mem::replace(&mut entries[i].1, value))
-                }
-                Err(i) => {
-                    entries.insert(i, (key.to_vec(), value));
-                    appended = i + 1 == entries.len();
-                    None
-                }
-            },
-            Node::Branch { .. } => unreachable!(),
-        };
+        let (old, appended) = self.dirty.get_mut(&leaf).unwrap().leaf_put(key, value);
         match old {
             Some(old) => self.free_value(&old),
             None => self.meta.entries += 1,
@@ -560,42 +538,81 @@ impl<'db> WriteTxn<'db> {
         while i < keys.len() {
             if self.meta.root == 0 {
                 let id = self.alloc();
-                self.dirty.insert(id, Node::Leaf(Vec::new()));
+                self.dirty.insert(id, Node::Page(new_page(KIND_LEAF)));
                 self.meta.root = id;
             }
             let (path, leaf) = self.writable_path(keys[i].as_ref());
             // the leaf takes the keys below the nearest separator to its right (none: the tree's right edge)
-            let upper = path.iter().rev().find_map(|&(branch, slot)| match &self.dirty[&branch] {
-                Node::Branch { entries, .. } => entries.get(slot).map(|(k, _)| k.clone()),
-                Node::Leaf(_) => None,
-            });
+            let upper = path.iter().rev().find_map(|&(branch, slot)| self.dirty[&branch].separator(slot));
             let end = i + keys[i..].partition_point(|k| upper.as_deref().is_none_or(|u| k.as_ref() < u));
 
-            let Node::Leaf(old) = std::mem::replace(self.dirty.get_mut(&leaf).unwrap(), Node::Leaf(Vec::new())) else { unreachable!() };
-            let mut merged = Vec::with_capacity(old.len() + end - i);
-            let mut old = old.into_iter().peekable();
-            for (j, key) in keys[i..end].iter().enumerate() {
-                let key = key.as_ref();
-                while let Some(entry) = old.next_if(|(k, _)| k.as_slice() < key) {
-                    merged.push(entry);
+            // into the page in place while it holds them; the rest (from the first key it can't hold, whose value is
+            // already made) merged into its entries, to split into pages
+            let mut j = i;
+            let mut pending = None;
+            if matches!(self.dirty[&leaf], Node::Page(_)) {
+                while j < end {
+                    let key = keys[j].as_ref();
+                    let previous = self.dirty[&leaf].leaf_get(key).map(|v| v.to_owned());
+                    let bytes = match &previous {
+                        Some(Value::Inline(bytes)) => value(j, Some(bytes)),
+                        Some(overflow) => value(j, Some(&self.read_value(&overflow.as_ref()))),
+                        None => value(j, None),
+                    };
+                    let stored = self.store_value_owned(bytes);
+                    let Node::Page(page) = self.dirty.get_mut(&leaf).unwrap() else { unreachable!() };
+                    let fitted = match leaf_search(&page[..], key) {
+                        Ok(at) => leaf_set_value(&mut page[..], at, &stored.as_ref()),
+                        Err(at) => leaf_insert(&mut page[..], at, key, &stored.as_ref()),
+                    };
+                    if !fitted {
+                        pending = Some(stored);
+                        break;
+                    }
+                    match previous {
+                        Some(previous) => self.free_value(&previous),
+                        None => self.meta.entries += 1,
+                    }
+                    j += 1;
                 }
-                let previous = old.next_if(|(k, _)| k.as_slice() == key).map(|(_, v)| v);
-                let bytes = match &previous {
-                    Some(Value::Inline(bytes)) => value(i + j, Some(bytes)),
-                    Some(overflow) => value(i + j, Some(&self.read_value(overflow))),
-                    None => value(i + j, None),
-                };
-                match previous {
-                    Some(previous) => self.free_value(&previous),
-                    None => self.meta.entries += 1,
-                }
-                let stored = self.store_value_owned(bytes);
-                merged.push((key.to_vec(), stored));
             }
             // appended: the run ended past every key the tree had
-            let appended = upper.is_none() && old.peek().is_none();
-            merged.extend(old);
-            *self.dirty.get_mut(&leaf).unwrap() = Node::Leaf(merged);
+            let appended = if j == end {
+                let Node::Page(page) = &self.dirty[&leaf] else { unreachable!() };
+                upper.is_none() && leaf_key(&page[..], count(&page[..]) - 1) == keys[end - 1].as_ref()
+            } else {
+                self.dirty.get_mut(&leaf).unwrap().widen();
+                let Node::Leaf(old) = std::mem::replace(self.dirty.get_mut(&leaf).unwrap(), Node::Leaf(Vec::new())) else { unreachable!() };
+                let mut merged = Vec::with_capacity(old.len() + end - j);
+                let mut old = old.into_iter().peekable();
+                for (n, key) in keys[j..end].iter().enumerate() {
+                    let key = key.as_ref();
+                    while let Some(entry) = old.next_if(|(k, _)| k.as_slice() < key) {
+                        merged.push(entry);
+                    }
+                    let previous = old.next_if(|(k, _)| k.as_slice() == key).map(|(_, v)| v);
+                    let stored = match pending.take() {
+                        Some(stored) => stored,
+                        None => {
+                            let bytes = match &previous {
+                                Some(Value::Inline(bytes)) => value(j + n, Some(bytes)),
+                                Some(overflow) => value(j + n, Some(&self.read_value(&overflow.as_ref()))),
+                                None => value(j + n, None),
+                            };
+                            self.store_value_owned(bytes)
+                        }
+                    };
+                    match previous {
+                        Some(previous) => self.free_value(&previous),
+                        None => self.meta.entries += 1,
+                    }
+                    merged.push((key.to_vec(), stored));
+                }
+                let appended = upper.is_none() && old.peek().is_none();
+                merged.extend(old);
+                *self.dirty.get_mut(&leaf).unwrap() = Node::Leaf(merged);
+                appended
+            };
             self.split_upwards(path, leaf, appended);
             i = end;
         }
@@ -611,10 +628,9 @@ impl<'db> WriteTxn<'db> {
             }
             match path.pop() {
                 Some((parent, slot)) => {
-                    if let Node::Branch { entries, .. } = self.dirty.get_mut(&parent).unwrap() {
-                        appended = appended && slot == entries.len();
-                        entries.splice(slot..slot, pieces);
-                    }
+                    let node = self.dirty.get_mut(&parent).unwrap();
+                    appended = appended && slot == node.len();
+                    node.insert_children(slot, pieces);
                     id = parent;
                 }
                 None => {
@@ -635,14 +651,16 @@ impl<'db> WriteTxn<'db> {
     /// then each page is filled as full as it fits, left to right, and the last takes the rest. Sorted inserts only
     /// ever append, so they would otherwise leave every page they split half empty (Graefe, 2011, §10.2).
     fn split(&mut self, id: PageId, appended: bool) -> Vec<(Vec<u8>, PageId)> {
-        let node = self.dirty.get(&id).unwrap();
+        let node = self.dirty.get_mut(&id).unwrap();
         if node.size() <= PAGE_SIZE {
+            node.settle();
             return Vec::new();
         }
-        let is_branch = matches!(node, Node::Branch { .. });
+        let is_branch = node.is_branch();
         let sizes: Vec<usize> = match node {
             Node::Leaf(entries) => entries.iter().map(|(k, v)| Node::entry_size_leaf(k, v)).collect(),
             Node::Branch { entries, .. } => entries.iter().map(|(k, _)| Node::entry_size_branch(k)).collect(),
+            Node::Page(_) => unreachable!("a page holds what fits it"),
         };
         let cuts = cuts(&sizes, is_branch, appended && !is_branch);
         let mut pieces = Vec::with_capacity(cuts.len());
@@ -657,13 +675,16 @@ impl<'db> WriteTxn<'db> {
                     let (separator, middle) = right.remove(0);
                     (separator, Node::Branch { leftmost: middle, entries: right })
                 }
+                Node::Page(_) => unreachable!(),
             });
         }
+        self.dirty.get_mut(&id).unwrap().settle();
         pieces
             .into_iter()
             .rev()
-            .map(|(separator, node)| {
+            .map(|(separator, mut node)| {
                 debug_assert!(node.size() <= PAGE_SIZE);
+                node.settle();
                 let right = self.alloc();
                 self.dirty.insert(right, node);
                 (separator, right)
@@ -677,13 +698,7 @@ impl<'db> WriteTxn<'db> {
             return false;
         }
         let (mut path, leaf) = self.writable_path(key);
-        let removed = match self.dirty.get_mut(&leaf).unwrap() {
-            Node::Leaf(entries) => {
-                let i = entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)).unwrap();
-                entries.remove(i).1
-            }
-            Node::Branch { .. } => unreachable!(),
-        };
+        let removed = self.dirty.get_mut(&leaf).unwrap().leaf_remove(key).unwrap();
         self.free_value(&removed);
         self.meta.entries -= 1;
 
@@ -692,18 +707,15 @@ impl<'db> WriteTxn<'db> {
         loop {
             let node = &self.dirty[&id];
             // a branch whose last child was removed is empty too (leftmost 0); one with a single child is "lone"
-            let empty_leaf = match node {
-                Node::Leaf(e) => e.is_empty(),
-                Node::Branch { leftmost, entries } => *leftmost == 0 && entries.is_empty(),
-            };
-            let lone_branch = matches!(node, Node::Branch { leftmost, entries } if *leftmost != 0 && entries.is_empty());
+            let empty_leaf = node.len() == 0 && (!node.is_branch() || node.leftmost() == 0);
+            let lone_branch = node.is_branch() && node.len() == 0 && node.leftmost() != 0;
             let Some(&(parent, slot)) = path.last() else {
                 // the root
                 if empty_leaf {
                     self.free(id);
                     self.meta.root = 0;
                 } else if lone_branch {
-                    let Node::Branch { leftmost, .. } = self.dirty[&id] else { unreachable!() };
+                    let leftmost = self.dirty[&id].leftmost();
                     self.free(id);
                     self.meta.root = leftmost;
                 }
@@ -718,12 +730,12 @@ impl<'db> WriteTxn<'db> {
             }
             if lone_branch {
                 // replace the branch by its only child
-                let Node::Branch { leftmost, .. } = self.dirty[&id] else { unreachable!() };
+                let leftmost = self.dirty[&id].leftmost();
                 self.free(id);
                 self.set_child(parent, slot, leftmost);
                 return true;
             }
-            if matches!(node, Node::Leaf(_)) && node.size() < PAGE_SIZE / 4 {
+            if !node.is_branch() && node.size() < PAGE_SIZE / 4 {
                 self.merge_leaf(parent, slot);
             }
             return true;
@@ -735,58 +747,51 @@ impl<'db> WriteTxn<'db> {
     }
 
     fn set_child(&mut self, parent: PageId, slot: usize, child: PageId) {
-        if let Node::Branch { leftmost, entries } = self.dirty.get_mut(&parent).unwrap() {
-            if slot == 0 { *leftmost = child } else { entries[slot - 1].1 = child }
-        }
+        self.dirty.get_mut(&parent).unwrap().set_child(slot, child);
     }
 
+    /// Removes a child slot. For slot 0, the next child becomes the leftmost (it already holds the keys from its
+    /// separator up); with no next child, the branch is left empty.
     fn remove_child(&mut self, parent: PageId, slot: usize) {
-        if let Node::Branch { leftmost, entries } = self.dirty.get_mut(&parent).unwrap() {
-            if slot == 0 {
-                // the next child becomes the leftmost (it already holds the keys from its separator up); with no
-                // next child, the branch is left empty
-                *leftmost = if entries.is_empty() { 0 } else { entries.remove(0).1 };
-            } else {
-                entries.remove(slot - 1);
-            }
-        }
+        self.dirty.get_mut(&parent).unwrap().remove_child(slot);
     }
 
     /// Merges the small leaf in `parent`'s child `slot` with a neighbour, if the two fit one page.
     fn merge_leaf(&mut self, parent: PageId, slot: usize) {
-        let children = match &self.dirty[&parent] {
-            Node::Branch { entries, .. } => entries.len() + 1,
-            Node::Leaf(_) => return,
-        };
+        let parent_node = &self.dirty[&parent];
+        if !parent_node.is_branch() {
+            return;
+        }
+        let children = parent_node.len() + 1;
         if children < 2 {
             return;
         }
         // merge the right one of the pair into the left
         let (left_slot, right_slot) = if slot + 1 < children { (slot, slot + 1) } else { (slot - 1, slot) };
-        let child = |s: usize, node: &Node| match node {
-            Node::Branch { leftmost, entries } => if s == 0 { *leftmost } else { entries[s - 1].1 },
-            Node::Leaf(_) => unreachable!(),
-        };
-        let left = child(left_slot, &self.dirty[&parent]);
-        let right = child(right_slot, &self.dirty[&parent]);
-        let right_node = match self.dirty.get(&right) {
+        let left = parent_node.child(left_slot);
+        let right = parent_node.child(right_slot);
+        let mut right_node = match self.dirty.get(&right) {
             Some(node) => node.clone(),
-            None => Node::decode(page_of(&self.map, right)),
+            None => Node::Page(copy_page(page_of(&self.map, right))),
         };
         let left_size = match self.dirty.get(&left) {
             Some(node) => node.size(),
-            None => Node::decode(page_of(&self.map, left)).size(),
+            None => used(page_of(&self.map, left)),
         };
-        if !matches!(right_node, Node::Leaf(_)) || left_size + right_node.size() - HEADER > PAGE_SIZE {
+        if right_node.is_branch() || left_size + right_node.size() - HEADER > PAGE_SIZE {
             return;
         }
         let left = self.writable(left);
         self.set_child(parent, left_slot, left);
+        right_node.widen();
         let Node::Leaf(right_entries) = right_node else { unreachable!() };
-        match self.dirty.get_mut(&left) {
-            Some(Node::Leaf(entries)) => entries.extend(right_entries),
+        let left_node = self.dirty.get_mut(&left).unwrap();
+        left_node.widen();
+        match left_node {
+            Node::Leaf(entries) => entries.extend(right_entries),
             _ => return,
         }
+        left_node.settle();
         self.free(right);
         self.remove_child(parent, right_slot);
     }
@@ -827,14 +832,30 @@ impl<'db> WriteTxn<'db> {
             inner.file.set_len(needed.max(length * 2))?;
         }
 
+        // the pages, in file order, each run of consecutive pages in one write (up to RUN pages): a transaction's
+        // new pages mostly come from the end of the file, one after another
+        const RUN: usize = 256;
+        let mut ids: Vec<PageId> = self.dirty.keys().chain(self.overflow.keys()).copied().collect();
+        ids.sort_unstable();
+        let mut run = Vec::with_capacity(RUN * PAGE_SIZE);
+        let mut first = 0;
+        for (n, &id) in ids.iter().enumerate() {
+            if run.is_empty() {
+                first = id;
+            }
+            let at = run.len();
+            run.resize(at + PAGE_SIZE, 0);
+            match self.dirty.get(&id) {
+                Some(node) => node.encode(&mut run[at..]),
+                None => run[at..].copy_from_slice(&self.overflow[&id]),
+            }
+            let next = ids.get(n + 1).copied();
+            if next != Some(id + 1) || run.len() == RUN * PAGE_SIZE {
+                inner.file.write_all_at(&run, first * PAGE_SIZE as u64)?;
+                run.clear();
+            }
+        }
         let mut buffer = vec![0u8; PAGE_SIZE];
-        for (&id, node) in &self.dirty {
-            node.encode(&mut buffer);
-            inner.file.write_all_at(&buffer, id * PAGE_SIZE as u64)?;
-        }
-        for (&id, page) in &self.overflow {
-            inner.file.write_all_at(page, id * PAGE_SIZE as u64)?;
-        }
         // every list page is written: taking a free page for the list can leave the last one empty
         for (n, &list_page) in list_pages.iter().enumerate() {
             let chunk = free.chunks(FREELIST_ENTRIES).nth(n).unwrap_or(&[]);

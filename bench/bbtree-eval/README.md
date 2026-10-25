@@ -31,14 +31,16 @@ per cell (inserts: all 10M). bbtree also through its batch calls (64 lookups, 16
 ## Results
 
 Apple M3 Max (36 GB), macOS 26.5, Rust 1.99, mimalloc; each cell run once, with the machine's swap nearly full.
-Million operations per second, higher is better.
+Million operations per second, higher is better. b-positive's rows are after #2 (copied pages edited in place,
+commits written in runs; `results/b-positive-after-2.csv`), with the first run's below them.
 
 | Keys | Map | Lookups | Inserts | Updates | Scans |
 |---|---|---:|---:|---:|---:|
 | u64 | bbtree | 6.78 | 3.72 | 5.93 | 1.63 |
 | | bbtree, batched | 12.29 | 7.51 | | |
 | | std `BTreeMap` | 3.72 | 2.85 | 3.46 | 0.80 |
-| | **b-positive** | **1.54** | **0.42** | **0.10** | **0.71** |
+| | **b-positive** | **1.65** | **1.34** | **0.93** | **0.75** |
+| | b-positive before #2 | 1.54 | 0.42 | 0.10 | 0.71 |
 | | scc `TreeIndex` | 1.92 | 1.96 | 2.02 | 0.44 |
 | | concurrent-map | 2.27 | 1.70 | 1.05 | 1.03 |
 | | crossbeam `SkipMap` | 0.81 | 0.88 | 0.84 | 0.09 |
@@ -46,7 +48,8 @@ Million operations per second, higher is better.
 | uuid | bbtree | 7.08 | 3.72 | 6.44 | 1.34 |
 | | bbtree, batched | 13.15 | 6.74 | | |
 | | std `BTreeMap` | 2.30 | 2.47 | 2.37 | 0.51 |
-| | **b-positive** | **1.51** | **0.42** | **0.10** | **0.67** |
+| | **b-positive** | **1.58** | **1.13** | **0.80** | **0.69** |
+| | b-positive before #2 | 1.51 | 0.42 | 0.10 | 0.67 |
 | | scc `TreeIndex` | 1.71 | 1.64 | 1.73 | 0.45 |
 | | concurrent-map | 1.44 | 1.11 | 0.85 | 0.78 |
 | | crossbeam `SkipMap` | 0.63 | 0.74 | 0.68 | 0.09 |
@@ -54,7 +57,8 @@ Million operations per second, higher is better.
 | str-json | bbtree | 4.86 | 2.86 | 4.73 | 1.00 |
 | | bbtree, batched | 8.98 | 5.03 | | |
 | | std `BTreeMap` | 1.11 | 1.34 | 1.08 | 0.39 |
-| | **b-positive** | **1.57** | **0.42** | **0.09** | **0.67** |
+| | **b-positive** | **1.68** | **1.16** | **0.81** | **0.67** |
+| | b-positive before #2 | 1.57 | 0.42 | 0.09 | 0.67 |
 | | scc `TreeIndex` | 0.86 | 1.11 | 0.84 | 0.33 |
 | | concurrent-map | 0.65 | 0.33 | 0.25 | 0.20 |
 | | crossbeam `SkipMap` | 0.39 | 0.48 | 0.38 | 0.08 |
@@ -68,9 +72,10 @@ once, on its own machine, and 45 ms for std's `BTreeMap` read back from a file.
   string keys (they sit flat in the page, not behind a pointer), so there it beats std's `BTreeMap` and every
   concurrent map; on integers it is about level with scc and concurrent-map. Its scans beat std's, scc's and
   crossbeam's everywhere.
-- **Writes:** inserts are 7–9× slower than bbtree's, updates about 60×. Copy-on-write copies each page it changes and
-  the path above it, and commits write them out; and the writer decodes every page it copies into a vector of owned
-  keys (b-positive#2).
+- **Writes:** inserts are 2.5–3× slower than bbtree's and updates 6–8× (they were 7–9× and 60× before #2, when the
+  writer decoded every page it copied into a vector of owned keys and a commit wrote pages one at a time, in hash
+  order). Copy-on-write still copies each page a transaction changes and the path above it, and commits write them;
+  what's left of a put is mostly the search within each page, which is #1.
 - The adapter allocates each u64 key's bytes (a small cost on the u64 rows only). The fourth key set of the post,
   Wikipedia titles, needs bbtree-eval's `fetch` and isn't run.
 
@@ -85,9 +90,9 @@ copies). The differences:
 | Shared prefixes | skipped, per node (from its fences) and per map | every key compared in full | in the summaries; keys stay whole, so the cursor still borrows them (b-positive#1) |
 | Key types | layouts specialized by type | byte strings | none: types belong to introvert's codecs |
 | Batches | interleaved searches with prefetching (1.8×) | one `get` at a time | `get_many` (b-positive#3) |
-| Writes | in place, in memory | copy-on-write, committed to a file; copied pages decoded into owned keys | edit copied pages encoded, in place (b-positive#2) |
+| Writes | in place, in memory | copy-on-write, committed to a file; copied pages edited in place (since #2) | — |
 | Durability, snapshots, restart | none (bbtree-mmap: a read-only file written once) | crash-safe commits, snapshot readers, instant open | — |
 
 None of the fixes changes what b-positive is: commits stay copy-on-write, readers stay lock-free snapshots, keys stay
-byte strings read in place. #1 changes the page format. Writes will stay slower than an in-memory map's however fast
-the page edits get: a commit copies and writes pages, which a map in memory never does.
+byte strings read in place. #1 changes the page format. Writes stay slower than an in-memory map's: a commit copies
+and writes pages, which a map in memory never does.
