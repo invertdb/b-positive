@@ -1,0 +1,104 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 923a528..0b86436 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -10,6 +10,7 @@ default-run = "bbtree-bench"
+ # The library under evaluation: the checkout beside this repository.
+ bbtree = { path = "../bbtree" }
+ bytes = "1"
++b-positive = { path = "@B_POSITIVE@" }
+ # Pins `bbtree-scaling`'s workers to CPUs (`sched_setaffinity`).
+ libc = "0.2"
+ mimalloc = "0.1"
+diff --git a/src/concurrent_maps.rs b/src/concurrent_maps.rs
+index a13397a..e8df387 100644
+--- a/src/concurrent_maps.rs
++++ b/src/concurrent_maps.rs
+@@ -29,6 +29,9 @@ pub(crate) trait ScalingKey:
+     /// Appends the key to a key dump (`--dump-keys`) as a line of its own:
+     /// an integer in decimal, a UUID in hex, a string as it is.
+     fn dump_line(&self, dump: &mut String);
++
++    /// The key's bytes, which sort as the key does (b-positive's keys).
++    fn ordered_bytes(&self) -> std::borrow::Cow<'_, [u8]>;
+ }
+ 
+ // A build without artmap or concurrent-map asks nothing of keys for them.
+@@ -42,18 +45,27 @@ pub(crate) trait ConcurrentMapKey {}
+ impl<K> ConcurrentMapKey for K {}
+ 
+ impl ScalingKey for u64 {
++    fn ordered_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
++        self.to_be_bytes().to_vec().into()
++    }
+     fn dump_line(&self, dump: &mut String) {
+         let _ = writeln!(dump, "{self}");
+     }
+ }
+ 
+ impl ScalingKey for u128 {
++    fn ordered_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
++        self.to_be_bytes().to_vec().into()
++    }
+     fn dump_line(&self, dump: &mut String) {
+         let _ = writeln!(dump, "{self}");
+     }
+ }
+ 
+ impl ScalingKey for [u8; 16] {
++    fn ordered_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
++        self[..].into()
++    }
+     fn dump_line(&self, dump: &mut String) {
+         for byte in self {
+             let _ = write!(dump, "{byte:02x}");
+@@ -63,6 +75,9 @@ impl ScalingKey for [u8; 16] {
+ }
+ 
+ impl ScalingKey for String {
++    fn ordered_bytes(&self) -> std::borrow::Cow<'_, [u8]> {
++        self.as_bytes().into()
++    }
+     fn dump_line(&self, dump: &mut String) {
+         assert!(
+             !self.contains('\n'),
+@@ -201,6 +216,8 @@ pub(crate) fn sum_of_first(entries: impl Iterator<Item = u64>, count: usize) ->
+ 
+ // Other crates' maps, each where its Cargo feature is on. They come after
+ // `shared_by_reference!`, which they use.
++mod b_positive;
++pub(crate) use self::b_positive::BPositive;
+ #[cfg(feature = "artmap")]
+ mod artmap;
+ #[cfg(feature = "concurrent-map")]
+diff --git a/src/scaling.rs b/src/scaling.rs
+index 114926c..f2692ca 100644
+--- a/src/scaling.rs
++++ b/src/scaling.rs
+@@ -72,7 +72,7 @@ use crate::concurrent_maps::DashMapOf;
+ use crate::concurrent_maps::SkipMapOf;
+ #[cfg(feature = "scc")]
+ use crate::concurrent_maps::TreeIndexOf;
+-use crate::concurrent_maps::{MapHandle, Owned, ScalingKey, SharedMap};
++use crate::concurrent_maps::{BPositive, MapHandle, Owned, ScalingKey, SharedMap};
+ use crate::datasets::{DataDirectory, DataFile, KeyList};
+ use crate::keys::KeyMaker;
+ use crate::latency::{LatencyHistogram, TickClock};
+@@ -642,6 +642,7 @@ impl ScalingRun {
+         <Owned<unsync::BBTreeMap<u64, u64>> as SharedMap<u64>>::NAME,
+         <Owned<BTreeMap<u64, u64>> as SharedMap<u64>>::NAME,
+         <Owned<HashMap<u64, u64>> as SharedMap<u64>>::NAME,
++        <BPositive as SharedMap<u64>>::NAME,
+         <BBTreeMap<u64, u64> as SharedMap<u64>>::NAME,
+         <RwLock<unsync::BBTreeMap<u64, u64>> as SharedMap<u64>>::NAME,
+         <RwLock<BTreeMap<u64, u64>> as SharedMap<u64>>::NAME,
+@@ -834,6 +835,9 @@ impl ScalingRun {
+         if self.picks(<Owned<HashMap<K, u64>> as SharedMap<K>>::NAME) {
+             self.measure::<K, Owned<HashMap<K, u64>>>(keys);
+         }
++        if self.picks(<BPositive as SharedMap<K>>::NAME) {
++            self.measure::<K, BPositive>(keys);
++        }
+         if self.picks(<BBTreeMap<K, u64> as SharedMap<K>>::NAME) {
+             self.measure::<K, BBTreeMap<K, u64>>(keys);
+         }

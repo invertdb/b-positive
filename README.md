@@ -57,6 +57,20 @@ Writes allocate a node copy per changed page. With mimalloc (`--features mimallo
 257k/s, against 201k/s with the system allocator. Reads change by about 3%. The library never
 sets an allocator: that's each binary's choice.
 
+### Against in-memory ordered maps (`bench/bbtree-eval`)
+
+bbtree's benchmark (10M entries, one thread, Apple M3 Max), million operations per second:
+
+| u64 keys | Lookups | Inserts | Updates | Scans |
+|---|---:|---:|---:|---:|
+| bbtree | 6.78 | 3.72 | 5.93 | 1.63 |
+| std `BTreeMap` | 3.72 | 2.85 | 3.46 | 0.80 |
+| b-positive | 1.54 | 0.42 | 0.10 | 0.71 |
+| scc `TreeIndex` | 1.92 | 1.96 | 2.02 | 0.44 |
+
+On string keys b-positive's lookups (1.57M/s) beat std's `BTreeMap` (1.11M/s) and every concurrent map. The gaps
+and their fixes (search within a page #1, writes #2, batched lookups #3) are in `bench/bbtree-eval/README.md`.
+
 ## Not yet
 
 - Rebalancing of underfull branches (leaves merge; an emptied branch is removed). Trees stay
