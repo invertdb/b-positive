@@ -101,3 +101,9 @@ batched), 1.9–2.2× on inserts, 2.0–2.3× on updates and 3.0–3.3× on scan
 - Lorie, R. A. (1977). Physical integrity in a large segmented database. *ACM Transactions on Database Systems*
   2(1).
 - Rodeh, O. (2008). B-trees, shadowing, and clones. *ACM Transactions on Storage* 3(4).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this crate by you, as
+defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
